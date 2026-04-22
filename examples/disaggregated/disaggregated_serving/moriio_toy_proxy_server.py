@@ -288,7 +288,14 @@ async def handle_request(api: str, request: Request):
             )
         )
 
-        req_data["max_tokens"] -= 1
+        # OpenAI Chat Completions: when both fields are present,
+        # max_completion_tokens takes precedence, so decrement that one
+        # to keep the per-request budget consistent with what the
+        # backend will enforce. Fall back to max_tokens otherwise.
+        if "max_completion_tokens" in req_data:
+            req_data["max_completion_tokens"] -= 1
+        elif "max_tokens" in req_data:
+            req_data["max_tokens"] -= 1
 
         req_data["kv_transfer_params"] = {
             "do_remote_decode": False,
