@@ -408,9 +408,22 @@ class MoRIIOConnectorScheduler:
                         )
 
             else:
-                # WRITE mode: prefill scheduler notifies the decode side that
-                # blocks are ready.  Parse the decode's host/notify_port from
-                # the request_id
+                # WRITE mode: decode (consumer) sends its allocated block ids
+                # to prefill (producer) so the producer knows where to RDMA-
+                # write the KV cache. Parse the producer's host/notify_port
+                # from the request_id.
+                #
+                # Caller here is the CONSUMER (this branch only runs when
+                # do_remote_prefill=True, which the proxy sets only on the
+                # decode's request). Per get_peer_zmq_from_request_id's
+                # docstring, is_producer describes the CALLER; the consumer
+                # needs the prefill's address, so is_producer=False.
+                #
+                # Prior `is_producer=True` was an upstream bug: it returned
+                # the decode's own address, so the consumer sent the structured
+                # block_notify to itself, which then tripped
+                # `assert get_role() == ROLE.PRODUCER` in
+                # moriio_engine.py:_handle_structured_message every request.
                 assert request.kv_transfer_params is not None, (
                     "kv_transfer_params should not be None"
                 )
@@ -418,7 +431,7 @@ class MoRIIOConnectorScheduler:
                 remote_dp_rank = request.kv_transfer_params.get("remote_dp_rank", 0)
 
                 peer_zmq = get_peer_zmq_from_request_id(
-                    request.request_id, is_producer=True
+                    request.request_id, is_producer=False
                 )
                 remote_host, _, remote_notify_port = parse_moriio_zmq_address(peer_zmq)
 
