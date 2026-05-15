@@ -394,7 +394,7 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
             ),
             remote_handshake_port=resolved_handshake_port,
             remote_notify_port=resolved_notify_port,
-            tp_size=kv_transfer_params.get("tp_size", 1),
+            tp_size=kv_transfer_params.get("tp_size", kv_transfer_params.get("remote_tp_size", 1)),
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
         )
         if write_mode:
