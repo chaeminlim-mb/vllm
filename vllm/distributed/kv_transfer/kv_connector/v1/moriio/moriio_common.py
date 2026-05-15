@@ -397,22 +397,54 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
     ):
         transfer_id = kv_transfer_params["transfer_id"]
 
-        # Parse host/ports from the request_id. The router embeds both zmq_addresses
-        # in the request_id
-        peer_zmq = get_peer_zmq_from_request_id(request_id, is_producer=write_mode)
-        remote_host, remote_handshake_port, remote_notify_port = (
-            parse_moriio_zmq_address(peer_zmq)
+        # Parse host/ports from the request_id. The toy proxy embeds both
+        # zmq_addresses in the request_id; an upstream-style proxy puts them
+        # in kv_transfer_params instead. Try request_id first, then fall back
+        # to kv_transfer_params keys. Do NOT return on parse failure — that
+        # leaks KV cache on the producer side because the request never gets
+        # registered for finish notification (re-introduces the bug fixed by
+        # 38921a7d4).
+        try:
+            peer_zmq = get_peer_zmq_from_request_id(
+                request_id, is_producer=write_mode
+            )
+            remote_host, remote_handshake_port, remote_notify_port = (
+                parse_moriio_zmq_address(peer_zmq)
+            )
+        except ValueError:
+            remote_host = None
+            remote_handshake_port = None
+            remote_notify_port = None
+
+        resolved_host = kv_transfer_params.get("remote_host", remote_host)
+        resolved_handshake_port = kv_transfer_params.get(
+            "remote_handshake_port", remote_handshake_port
         )
+        resolved_notify_port = kv_transfer_params.get(
+            "remote_notify_port", remote_notify_port
+        )
+        if (
+            resolved_host is None
+            or resolved_handshake_port is None
+            or resolved_notify_port is None
+        ):
+            raise ValueError(
+                f"MoRIIO add_new_req: could not resolve peer host/ports for "
+                f"{request_id!r}; neither request_id parse nor "
+                f"kv_transfer_params provided them"
+            )
 
         _req = ReqMeta(
             transfer_id=transfer_id,
             local_block_ids=local_block_ids,
             remote_block_ids=kv_transfer_params["remote_block_ids"],
             remote_engine_id=kv_transfer_params["remote_engine_id"],
-            remote_host=remote_host,
-            remote_port=remote_handshake_port,
-            remote_handshake_port=remote_handshake_port,
-            remote_notify_port=remote_notify_port,
+            remote_host=resolved_host,
+            remote_port=kv_transfer_params.get(
+                "remote_port", resolved_handshake_port
+            ),
+            remote_handshake_port=resolved_handshake_port,
+            remote_notify_port=resolved_notify_port,
             tp_size=kv_transfer_params.get("tp_size", 1),
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
         )

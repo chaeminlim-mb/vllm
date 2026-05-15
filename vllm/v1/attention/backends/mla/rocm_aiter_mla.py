@@ -483,8 +483,19 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # We track whether persistent metadata was successfully computed
         # so forward_mqa can skip passing it (falling back to the kernel
         # computing its own metadata internally, like v0.18.0).
+        # MAF H1 WORKAROUND: forcibly skip the persistent-metadata fast path.
+        # On gfx942 with DP=8 (each rank has full nhead=128), the persistent
+        # qh128 MLA ASM kernel (`mla_a8w8_qh128_m32x4_n16x2_msk0_ps`) faults
+        # with "Write access to a read-only page" during warmup. With this
+        # flag false, the kernel computes metadata internally (v0.18.0 path)
+        # — slightly slower but stable. Re-enable by setting
+        # VLLM_AITER_MLA_PERSISTENT_METADATA=1.
+        import os as _os
         has_persistent_metadata = False
-        if max_qo_len == 1:
+        _persistent_meta_env = _os.getenv(
+            "VLLM_AITER_MLA_PERSISTENT_METADATA", "0"
+        )
+        if max_qo_len == 1 and _persistent_meta_env == "1":
             from aiter import get_mla_metadata_v1
 
             get_mla_metadata_v1(

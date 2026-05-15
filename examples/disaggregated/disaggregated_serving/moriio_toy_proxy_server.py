@@ -43,10 +43,33 @@ def _listen_for_register(hostname, port):
     global decode_instances
 
     while True:
-        socks = dict(poller.poll())
-        if router_socket in socks:
+        try:
+            socks = dict(poller.poll())
+        except Exception as e:
+            logger.warning("poller.poll() failed: %s; continuing", e)
+            continue
+        if router_socket not in socks:
+            continue
+        try:
             remote_addr, msg = router_socket.recv_multipart()
+        except Exception as e:
+            logger.warning("recv_multipart failed: %s", e)
+            continue
+        try:
             data = msgpack.loads(msg)
+        except Exception as e:
+            logger.warning(
+                "malformed msgpack from %r (%d bytes): %s",
+                remote_addr, len(msg), e,
+            )
+            continue
+        if not isinstance(data, dict):
+            logger.warning(
+                "register payload from %r was %s, expected dict; ignoring",
+                remote_addr, type(data).__name__,
+            )
+            continue
+        try:
             if data.get("type") == "HELLO":
                 pass
             elif data.get("type") in ("P", "D"):
@@ -122,6 +145,10 @@ def _listen_for_register(hostname, port):
                     "Received message with unrecognized type %r; ignoring",
                     data.get("type"),
                 )
+        except Exception:
+            logger.exception(
+                "register listener iteration failed; continuing"
+            )
 
 
 def start_service_discovery(hostname, port):
