@@ -377,6 +377,22 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
         resolved_notify_port = kv_transfer_params.get(
             "remote_notify_port", remote_notify_port
         )
+        # Fallbacks for cleanup-path / short-id requests (e.g. requests that
+        # hit the external prefix cache so heavily that the engine takes the
+        # "aborted before scheduling" branch and surfaces a short internal
+        # request_id without the proxy's ___prefill_addr_... prefix). The
+        # proxy still forwards remote_hosts for multi-node TP, so the producer
+        # head is recoverable as remote_hosts[0]; ports default to MoRIIO's
+        # well-known values which match the kv_connector_extra_config the
+        # exp scripts pass on every container.
+        if resolved_host is None:
+            _remote_hosts = kv_transfer_params.get("remote_hosts")
+            if _remote_hosts:
+                resolved_host = _remote_hosts[0]
+        if resolved_handshake_port is None:
+            resolved_handshake_port = int(MoRIIOConstants.DEFAULT_HANDSHAKE_PORT)
+        if resolved_notify_port is None:
+            resolved_notify_port = int(MoRIIOConstants.DEFAULT_NOTIFY_PORT)
         if (
             resolved_host is None
             or resolved_handshake_port is None
