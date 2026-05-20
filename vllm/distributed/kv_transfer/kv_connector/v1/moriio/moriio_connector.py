@@ -16,7 +16,6 @@ import numpy as np
 import torch
 import zmq
 
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -308,7 +307,11 @@ class MoRIIOConnectorScheduler:
         # connector_output.finished_sending so the scheduler frees the blocks to avoid
         # hanging indefinitely waiting for a free notification that never comes.
         self._deferred_send_deadlines: dict[ReqId, float] = {}
-        self._defer_timeout = envs.VLLM_MORIIO_DEFER_TIMEOUT
+        self._defer_timeout = float(
+            self.kv_transfer_config.kv_connector_extra_config.get(
+                "defer_timeout", MoRIIOConstants.DEFAULT_DEFER_TIMEOUT
+            )
+        )
         self.paths: dict[str, zmq.Socket] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
@@ -755,7 +758,6 @@ class MoRIIOConnectorWorker:
         self.moriio_engine = None
         self._handle_request_thread = None
         self._ping_thread = None
-        self._transfer_timeout = envs.VLLM_MORIIO_TRANSFER_TIMEOUT
         self._writer = MoRIIOWriter(self)
         # Completions that arrived before transfer_id_to_request_id was populated.
         # Retried each step until the mapping is established.
@@ -792,7 +794,11 @@ class MoRIIOConnectorWorker:
         )
 
         # Agent.
-        self.moriio_wrapper = MoRIIOWrapper(tp_rank=self.tp_rank, dp_rank=self.dp_rank)
+        self.moriio_wrapper = MoRIIOWrapper(
+            tp_rank=self.tp_rank,
+            dp_rank=self.dp_rank,
+            transfer_timeout=self.moriio_config.transfer_timeout,
+        )
         self.moriio_wrapper.set_moriio_engine(self.moriio_engine)
         self.moriio_wrapper.set_backend_type(BackendType.RDMA)
         self.moriio_wrapper.notify_port = self.moriio_config.notify_port
@@ -1569,7 +1575,7 @@ class MoRIIOConnectorWorker:
 
         if remote_engine_id is None:
             return
-        _deadline = time.monotonic() + self._transfer_timeout
+        _deadline = time.monotonic() + self.moriio_config.transfer_timeout
         while True:
             if (
                 self._ready_requests.empty()
@@ -1578,7 +1584,7 @@ class MoRIIOConnectorWorker:
                 if time.monotonic() > _deadline:
                     logger.warning(
                         "Timed out waiting for write_ready_flags[%s]; "
-                        "adjust with VLLM_MORIIO_TRANSFER_TIMEOUT",
+                        "adjust with kv_connector_extra_config.transfer_timeout",
                         remote_engine_id,
                     )
                     break
@@ -1642,7 +1648,7 @@ class MoRIIOConnectorWorker:
 
         if remote_engine_id is None and not wait_handshake_readd_req:
             return
-        _deadline = time.monotonic() + self._transfer_timeout
+        _deadline = time.monotonic() + self.moriio_config.transfer_timeout
         while True:
             if (
                 self._ready_requests.empty()
@@ -1652,7 +1658,7 @@ class MoRIIOConnectorWorker:
                 if time.monotonic() > _deadline:
                     logger.warning(
                         "Timed out waiting for load_ready_flag[%s]; "
-                        "adjust with VLLM_MORIIO_TRANSFER_TIMEOUT",
+                        "adjust with kv_connector_extra_config.transfer_timeout",
                         remote_engine_id,
                     )
                     break
