@@ -214,6 +214,14 @@ def example_round_robin_dp_loader(request_number, dp_size):
     return request_nums % dp_size
 
 
+@app.route("/health", methods=["GET"])
+async def health():
+    # exp_common.sh:971 post-bench wait_health probes the PROXY url (not the
+    # vllm engine), and treats any non-200 as "SERVER DIED" → kills bench
+    # mid-sweep even when prefill+decode are healthy. Return 200 unconditionally.
+    return ("ok", 200)
+
+
 @app.route("/v1/completions", methods=["POST"])
 async def handle_completions_request():
     return await handle_request("/completions", request)

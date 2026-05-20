@@ -798,6 +798,14 @@ class MoRIIOConnectorWorker:
             use_mla=self.use_mla,
         )
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
+        # READ-mode producer: buffer transfer_ids whose decode-side notify
+        # arrived BEFORE start_load_kv populated transfer_id_to_request_id.
+        # Without this, get_finished() drops the notification → scheduler
+        # never marks the request done_sending → producer KV blocks leak →
+        # KV cache fills at high concurrency (hard wedge on prefill side at
+        # c>=128 in DP8EP 8K-input runs). Retried on every get_finished
+        # call until mapping is populated.
+        self._pending_unmapped_done_tids: set[TransferId] = set()
 
         # TODO: consider the integration of flashinfer or other backends.
         self.backend_name = backend.get_name()
@@ -1201,6 +1209,17 @@ class MoRIIOConnectorWorker:
 
         self.dst_num_blocks[self.engine_id] = self.num_blocks
         self.kv_caches = kv_caches  # layer name to kv cache
+        # DIAG: dump per-layer shape/stride/MR-len so we can compare against
+        # the first-layer values that _compute_block_transfer_offsets assumes
+        # uniform. If any non-first layer differs, _read_blocks will compute
+        # offsets that overflow the smaller MR → C++ "length out of range".
+        for _ln, _kvc in kv_caches.items():
+            _mr_len = _kvc.numel() * _kvc.element_size()
+            logger.warning(
+                "MoRIIO MR per-layer: %s shape=%s stride=%s elt=%d mr_len=%d",
+                _ln, tuple(_kvc.shape), tuple(_kvc.stride()),
+                _kvc.element_size(), _mr_len,
+            )
         kv_caches_base_addr = []
         caches_data = []
 
@@ -1300,17 +1319,30 @@ class MoRIIOConnectorWorker:
                 # was populated at scheduling time by update_state_after_alloc
                 # and synced to the worker by start_load_kv). Pop on success
                 # to keep the persistent worker map bounded.
-                for tid in done_sending_raw:
+                # Combine newly-arrived done tids with tids buffered from
+                # prior calls whose mapping wasn't populated yet by
+                # start_load_kv. Retry the lookup on every call; once the
+                # scheduler→worker sync runs, the mapping appears and the
+                # request gets marked done_sending so its KV blocks free.
+                candidate_tids = (
+                    set(done_sending_raw) | self._pending_unmapped_done_tids
+                )
+                self._pending_unmapped_done_tids = set()
+                for tid in candidate_tids:
                     mapped = self.transfer_id_to_request_id.pop(tid, None)
                     if mapped is not None:
                         done_sending.add(mapped)
                     else:
-                        logger.warning(
-                            "get_finished (producer READ): no mapping for "
-                            "transfer_id %s; dropping notification to avoid "
-                            "scheduler assertion on unknown request_id",
-                            tid,
-                        )
+                        # Mapping not yet populated — keep pending, retry
+                        # next tick. Without this buffer the notification
+                        # is lost and the producer's KV blocks leak.
+                        self._pending_unmapped_done_tids.add(tid)
+                if self._pending_unmapped_done_tids:
+                    logger.debug(
+                        "get_finished (producer READ): %d tid(s) "
+                        "pending mapping (race vs start_load_kv)",
+                        len(self._pending_unmapped_done_tids),
+                    )
             else:
                 # WRITE mode: producer locally appends its own internal
                 # request_id to done_req_ids in _finalize_if_complete, so no
@@ -1523,6 +1555,7 @@ class MoRIIOConnectorWorker:
             remote_block_ids=meta.remote_block_ids,
             remote_host=actual_remote_host,
             remote_notify_port=meta.remote_notify_port,
+            remote_dp_rank=meta.remote_dp_rank,
         )
 
     def _write_blocks_for_req(self, req_id: ReqId, meta: ReqMeta, layer_name, kv_layer):
@@ -1677,17 +1710,60 @@ class MoRIIOConnectorWorker:
         request_id: str,
         remote_host: str,
         remote_notify_port: int,
+        remote_dp_rank: int = 0,
     ) -> None:
         if self.mode == MoRIIOMode.WRITE:
             return
 
-        dp0_engine_id = self.get_engine_name_with_dp(dst_engine_id, 0)
-        sessions, remote_moriio_meta = self._get_built_session(dp0_engine_id)
+        # Use the prefill DP rank that actually computed the KV (forwarded by
+        # the proxy via kv_transfer_params["remote_dp_rank"]). Hardcoding 0
+        # leads to reading from remote DP0's MR for blocks that live in
+        # rank R's memory — wrong data at low conc and "length out of range"
+        # overflow at high conc (per-rank num_blocks differs by ~6107 blocks
+        # on DSR1-0528 DP8EP, so high block_ids overshoot rank 0's MR).
+        remote_dp_engine_id = self.get_engine_name_with_dp(
+            dst_engine_id, int(remote_dp_rank)
+        )
+        sessions, remote_moriio_meta = self._get_built_session(remote_dp_engine_id)
 
         first_layer = list(self.layer_name_to_local_kv_cache_metadata.keys())[0]
         offs = self._compute_block_transfer_offsets(
             first_layer, local_block_ids, remote_block_ids, remote_moriio_meta
         )
+
+        # DIAG: log per-call so we can pinpoint which (decode_rank,
+        # remote_rank) pair overflows. Fires on FIRST few calls AND on every
+        # overflow. local_mr_len = decode's own kv_cache size; remote_mr_len
+        # = remote rank's num_blocks * block_len (from handshake metadata).
+        _max_local = max(o + s for o, s in zip(offs[0], offs[2])) if offs[2] else 0
+        _max_remote = max(o + s for o, s in zip(offs[1], offs[2])) if offs[2] else 0
+        _first_kvc = self.kv_caches[first_layer]
+        _local_mr_len = _first_kvc.numel() * _first_kvc.element_size()
+        try:
+            _remote_mr_len = (
+                int(remote_moriio_meta.num_blocks)
+                * int(remote_moriio_meta.block_len)
+            )
+        except Exception:
+            _remote_mr_len = -1
+        _diag_n = getattr(self, "_diag_read_blocks_n", 0) + 1
+        self._diag_read_blocks_n = _diag_n
+        _overflow = _max_local > _local_mr_len or (
+            _remote_mr_len > 0 and _max_remote > _remote_mr_len
+        )
+        if _diag_n <= 3 or _overflow:
+            logger.warning(
+                "MoRIIO READ diag #%d: dp_rank=%s remote_dp_rank=%s "
+                "engine_id=%s max_local=%d local_mr_len=%d "
+                "max_remote=%d remote_mr_len=%d "
+                "max_local_bid=%s max_remote_bid=%s n_blocks=%d overflow=%s",
+                _diag_n, getattr(self, "dp_rank", "?"), int(remote_dp_rank),
+                remote_dp_engine_id, _max_local, _local_mr_len,
+                _max_remote, _remote_mr_len,
+                max(local_block_ids) if local_block_ids else -1,
+                max(remote_block_ids) if remote_block_ids else -1,
+                len(local_block_ids), _overflow,
+            )
 
         for layer_name in self.layer_name_to_local_kv_cache_metadata:
             sess_idx = list(self.layer_name_to_local_kv_cache_metadata.keys()).index(
@@ -1699,7 +1775,18 @@ class MoRIIOConnectorWorker:
             )
             with self.moriio_wrapper.lock:
                 self._recving_transfers[request_id].append(transfer_status)
+                # Notify-back must target the SPECIFIC prefill DP rank that
+                # owns the KV (== remote_dp_rank), not always rank 0. Each
+                # rank's notify listener binds to base_port + port_offset.
+                # Using only tp_rank here meant decode always notified
+                # prefill DP0 — so prefill DP4 (where the actual KV lived)
+                # never got the completion signal, KV blocks leaked, and
+                # prefill backpressured to 99.9% KV → wedge at high conc
+                # (no MoRI error because the read itself succeeded).
                 self._recving_transfers_callback_addr[request_id] = (
                     remote_host,
-                    str(remote_notify_port + self.tp_rank),
+                    str(
+                        remote_notify_port
+                        + get_port_offset(int(remote_dp_rank), self.tp_rank)
+                    ),
                 )

@@ -320,6 +320,12 @@ class ReqMeta:
     remote_engine_id: str
     tp_size: int
     remote_dp_size: int
+    # DP rank that handled the prefill on the remote side. Proxy sets this
+    # from `selected_prefill_dp_rank` in kv_transfer_params. Used by
+    # `_read_blocks` to pick the correct per-rank session/MR instead of
+    # always reading from remote DP0 (which mismatches num_blocks across
+    # ranks and overflows remote DP0's MR at high concurrency).
+    remote_dp_rank: int = 0
     # Ordered list of all prefill-instance host IPs for multi-node TP.
     # Each decode worker picks remote_hosts[tp_rank // ranks_per_node] as its
     # actual peer host for handshake + post-transfer notify. None or len<=1
@@ -409,6 +415,7 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
                 kv_transfer_params.get("remote_tp_size", 1),
             ),
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
+            remote_dp_rank=int(kv_transfer_params.get("remote_dp_rank", 0) or 0),
             remote_hosts=kv_transfer_params.get("remote_hosts"),
         )
         if write_mode:
