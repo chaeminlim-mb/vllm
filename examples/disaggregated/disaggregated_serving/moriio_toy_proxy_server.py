@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import copy
+import json
 import logging
 import os
 import socket
@@ -357,70 +358,94 @@ async def handle_request(api: str, request: Request):
         )
 
 
-async def send_profile_cmd(req_data: dict, profiler_cmd: str):
-    assert profiler_cmd in {"start", "stop"}
+# ── Profiler fan-out ────────────────────────────────────────────────────────
+# benchmark_serving.py --profile sends POST /start_profile (and /stop_profile)
+# to the base URL it was given. For PD that base URL is the proxy, so we
+# forward the request to every registered prefill + decode backend so torch
+# traces are captured on both sides of the disaggregation for the same window.
 
+
+async def _post_profile_to_endpoint(session, base_url, cmd, payload):
+    url = f"{base_url}/{cmd}_profile"
+    try:
+        async with session.post(url, json=payload) as resp:
+            if resp.status == 404:
+                logger.warning("Profiling endpoint missing on %s", url)
+                return None
+            if resp.status >= 400:
+                body = await resp.text()
+                raise RuntimeError(f"{url} returned {resp.status}: {body}")
+            # vLLM's /start_profile and /stop_profile return plain text with no
+            # JSON content-type header. content_type=None bypasses aiohttp's
+            # mimetype check; on parse failure fall back to a synthetic envelope.
+            try:
+                return await resp.json(content_type=None)
+            except Exception:
+                return {"status": "ok", "raw": await resp.text()}
+    except aiohttp.ClientResponseError as exc:
+        if exc.status == 404:
+            logger.warning("Profiling endpoint missing on %s", url)
+            return None
+        raise
+
+
+def _collect_backend_base_urls():
     with _list_lock:
-        p_instances = list(prefill_instances)
-        d_instances = list(decode_instances)
+        p_urls = []
+        for inst in prefill_instances:
+            _p = urlparse(inst["request_address"])
+            p_urls.append(f"http://{_p.hostname}:{_p.port}")
+        d_urls = []
+        for inst in decode_instances:
+            _p = urlparse(inst["request_address"])
+            d_urls.append(f"http://{_p.hostname}:{_p.port}")
+    return p_urls, d_urls
 
-    if not p_instances and not d_instances:
-        raise RuntimeError(
-            "Service Unavailable: No prefill or decode instances are registered."
+
+async def _handle_profile_command(cmd):
+    payload = await request.get_json(silent=True) or {}
+    p_urls, d_urls = _collect_backend_base_urls()
+    if not p_urls and not d_urls:
+        return await make_response(
+            (
+                json.dumps({"error": "no prefill or decode backends registered"}),
+                503,
+                {"Content-Type": "application/json"},
+            )
         )
 
-    headers = {
-        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
-    }
-
-    tasks = []
-
+    # /stop_profile flush time scales with concurrency × profile metadata
+    # (record_shapes / with_stack add GBs of per-event data). For heavy
+    # profile runs (c=100+ with full annotations) the worker stop_profile
+    # RPC can block for 10–20 minutes while torch exports the trace and
+    # writes profiler_out_N.txt. Match the chat-completions timeout window
+    # so we don't return 500 before the backend finishes flushing.
     async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=60)
+        timeout=aiohttp.ClientTimeout(total=3600)
     ) as session:
-        for instances in (p_instances, d_instances):
-            for inst in instances:
-                _p = urlparse(inst["request_address"])
-                url = f"http://{_p.hostname}:{_p.port}/{profiler_cmd}_profile"
+        p_results, d_results = await asyncio.gather(
+            asyncio.gather(*[
+                _post_profile_to_endpoint(session, u, cmd, payload) for u in p_urls
+            ]),
+            asyncio.gather(*[
+                _post_profile_to_endpoint(session, u, cmd, payload) for u in d_urls
+            ]),
+        )
 
-                tasks.append(
-                    session.post(
-                        url,
-                        json=req_data,
-                        headers=headers,
-                    )
-                )
-
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for r in responses:
-            if isinstance(r, Exception):
-                raise r
-            if r.status >= 400:
-                msg = await r.text()
-                raise RuntimeError(f"{profiler_cmd}_profile failed: {r.status}, {msg}")
-
-        return await responses[0].json()
+    return {
+        "prefill": [{"url": u, "result": r} for u, r in zip(p_urls, p_results)],
+        "decode": [{"url": u, "result": r} for u, r in zip(d_urls, d_results)],
+    }
 
 
 @app.post("/start_profile")
 async def start_profile():
-    try:
-        req_data = await request.get_json()
-        return await send_profile_cmd(req_data, "start")
-    except Exception as e:
-        logger.exception("start_profile failed: %s", e)
-        return await make_response((str(e), 500))
+    return await _handle_profile_command("start")
 
 
 @app.post("/stop_profile")
 async def stop_profile():
-    try:
-        req_data = await request.get_json()
-        return await send_profile_cmd(req_data, "stop")
-    except Exception as e:
-        logger.exception("stop_profile failed: %s", e)
-        return await make_response((str(e), 500))
+    return await _handle_profile_command("stop")
 
 
 if __name__ == "__main__":

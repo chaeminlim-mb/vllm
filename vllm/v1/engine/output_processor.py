@@ -246,7 +246,7 @@ class RequestState:
             output_kind = request.pooling_params.output_kind
 
         assert request.external_req_id is not None
-        return cls(
+        state = cls(
             request_id=request.request_id,
             external_req_id=request.external_req_id,
             parent_req=parent_req,
@@ -268,6 +268,16 @@ class RequestState:
             stream_interval=stream_interval,
             stream_input=request.resumable,
         )
+        # PD: pick up producer-side prefill-complete wall-clock TS shipped via
+        # kv_transfer_params (see MoRIIOConnector.request_finished). Used on
+        # the D engine to compute stage-3 KV transfer time.
+        if state.stats is not None and sampling_params is not None:
+            extra_args = sampling_params.extra_args or {}
+            kv_params = extra_args.get("kv_transfer_params") or {}
+            prefill_complete_ts = kv_params.get("prefill_complete_ts")
+            if isinstance(prefill_complete_ts, (int, float)):
+                state.stats.remote_prefill_complete_ts = float(prefill_complete_ts)
+        return state
 
     def make_request_output(
         self,

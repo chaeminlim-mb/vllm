@@ -637,6 +637,10 @@ class MoRIIOConnectorScheduler:
             # engine's TP group (rank 0 first). Decode workers use this to
             # pick the correct producer host per their tp_rank.
             remote_hosts=self.node_hosts,
+            # Wall-clock TS captured at end of P-side prefill (request_finished
+            # runs after FINISHED_LENGTH_CAPPED). Consumed by D's OutputProcessor
+            # to derive stage-3 KV transfer time. Requires NTP sync across nodes.
+            prefill_complete_ts=time.time(),
         )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:

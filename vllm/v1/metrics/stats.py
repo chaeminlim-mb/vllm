@@ -219,6 +219,15 @@ class RequestStateStats:
     # Track if this request is corrupted (NaNs in logits)
     is_corrupted: bool = False
 
+    # PD breakdown — D-side only.
+    # remote_prefill_complete_ts: wall-clock TS captured on P at request_finished
+    # (prefill compute done), shipped via kv_transfer_params. NOT monotonic —
+    # comparable across nodes only with NTP-synced clocks.
+    # kv_xfer_complete_ts: engine-core monotonic TS captured on D when scheduler
+    # observes finished_recving for this request (KV_XFER_COMPLETE event).
+    remote_prefill_complete_ts: float = 0.0
+    kv_xfer_complete_ts: float = 0.0
+
 
 @dataclass
 class FinishedRequestStats:
@@ -237,6 +246,20 @@ class FinishedRequestStats:
     mean_time_per_output_token: float = 0.0
     is_corrupted: bool = False
     num_cached_tokens: int = 0
+
+    # PD 5-stage breakdown (D-side only; P-side fields above are reused on P).
+    # Stage 1 = queued_time (P engine)
+    # Stage 2 = prefill_time (P engine)
+    # Stage 3 = kv_xfer_time (D engine: kv_xfer_complete_ts - remote_prefill_complete_ts)
+    # Stage 4 = decode_queue_time_post_kv (D engine: scheduled_ts - kv_xfer_complete_ts)
+    # Stage 5 = decode_exec_time_post_kv (D engine: last_token_ts - scheduled_ts)
+    # NOTE: stage 3 mixes wall-clock (P) and monotonic (D) clocks; only meaningful
+    # if both nodes use the same time source (e.g. NTP-synced wall-clock).
+    remote_prefill_complete_ts: float = 0.0
+    kv_xfer_complete_ts: float = 0.0
+    kv_xfer_time: float = 0.0
+    decode_queue_time_post_kv: float = 0.0
+    decode_exec_time_post_kv: float = 0.0
 
 
 @dataclass
@@ -424,6 +447,10 @@ class IterationStats:
             elif event.type == EngineCoreEventType.PREEMPTED:
                 self.num_preempted_reqs += 1
                 lora_states.request_waiting(req_id, lora_name)
+            elif event.type == EngineCoreEventType.KV_XFER_COMPLETE:
+                # D-side only; emitted by scheduler when finished_recving fires.
+                if req_stats.kv_xfer_complete_ts == 0.0:
+                    req_stats.kv_xfer_complete_ts = event.timestamp
 
     def update_from_finished_request(
         self,
@@ -458,6 +485,25 @@ class IterationStats:
             else 0
         )
 
+        # PD 5-stage breakdown (D-side). Stages are zero unless this is a
+        # decode-side finish in a PD setup. Stage 3 requires NTP-synced
+        # wall-clock between P and D.
+        kv_xfer_time = 0.0
+        decode_queue_time_post_kv = 0.0
+        decode_exec_time_post_kv = 0.0
+        if req_stats.kv_xfer_complete_ts > 0.0:
+            if req_stats.remote_prefill_complete_ts > 0.0:
+                kv_xfer_time = (
+                    req_stats.kv_xfer_complete_ts
+                    - req_stats.remote_prefill_complete_ts
+                )
+            decode_queue_time_post_kv = (
+                req_stats.scheduled_ts - req_stats.kv_xfer_complete_ts
+            )
+            decode_exec_time_post_kv = (
+                req_stats.last_token_ts - req_stats.scheduled_ts
+            )
+
         finished_req = FinishedRequestStats(
             finish_reason=finish_reason,
             request_id=request_id,
@@ -472,6 +518,11 @@ class IterationStats:
             mean_time_per_output_token=mean_time_per_output_token,
             is_corrupted=req_stats.is_corrupted,
             num_cached_tokens=num_cached_tokens,
+            remote_prefill_complete_ts=req_stats.remote_prefill_complete_ts,
+            kv_xfer_complete_ts=req_stats.kv_xfer_complete_ts,
+            kv_xfer_time=kv_xfer_time,
+            decode_queue_time_post_kv=decode_queue_time_post_kv,
+            decode_exec_time_post_kv=decode_exec_time_post_kv,
         )
         self.finished_requests.append(finished_req)
 

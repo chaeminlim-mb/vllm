@@ -2216,6 +2216,8 @@ class Scheduler(SchedulerInterface):
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
+                if self.log_stats:
+                    req.record_event(EngineCoreEventType.KV_XFER_COMPLETE)
             elif RequestStatus.is_finished(req.status):
                 self._free_blocks(req)
             else:
