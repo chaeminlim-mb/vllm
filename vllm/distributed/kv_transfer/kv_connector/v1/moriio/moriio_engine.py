@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     HandshakeError,
     LayerTransferPlan,
     MoRIIOAgentMetadata,
+    MoRIIOConstants,
     MoRIIOError,
     RemoteAllocInfo,
     TransferError,
