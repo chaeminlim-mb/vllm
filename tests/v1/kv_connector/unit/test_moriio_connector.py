@@ -24,6 +24,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOAgentMetadata,
     MoRIIOConnectorMetadata,
     MoRIIOConstants,
+    MoRIIOMode,
+    ReqMeta,
     zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
@@ -580,3 +582,177 @@ def test_moriio_handshake_returns_metadata(mock_parallel_groups):
             assert isinstance(metadata, MoRIIOAgentMetadata), (
                 "Decoded metadata is not MoRIIOAgentMetadata"
             )
+
+
+# ---------------------------------------------------------------------------
+# Cross-node DP routing tests (regression guards for the cross-node DP fixes
+# that landed in the same change as ReqMeta.remote_dp_rank,
+# _pick_host_for_dp_rank, dp_rank_to_host, and the per-dp save_kv_layer gate).
+# Pure-function tests that exercise the routing helpers directly without
+# touching the network or mori. Skipped together with the rest of the file on
+# non-ROCm CI by the module-level pytestmark.
+# ---------------------------------------------------------------------------
+
+
+def _bare_worker():
+    """Build a MoRIIOConnectorWorker without running __init__.
+
+    __init__ wires zmq sockets, ROCm groups, and the mori engine; for the
+    pure routing tests below we only need the unbound methods and a handful
+    of attributes, so we bypass __init__ and inject what each test needs.
+    """
+    return MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+
+
+def test_pick_host_for_dp_rank_cross_node():
+    """dp_rank slices the remote node list when remote_hosts has >1 entry."""
+    worker = _bare_worker()
+    meta = MagicMock(
+        remote_hosts=["10.0.0.1", "10.0.0.2"],
+        remote_dp_size=16,
+        remote_host="10.0.0.1",
+    )
+    # 16 dp ranks across 2 nodes => dp_per_node = 8.
+    assert worker._pick_host_for_dp_rank(meta, 0) == "10.0.0.1"
+    assert worker._pick_host_for_dp_rank(meta, 7) == "10.0.0.1"
+    assert worker._pick_host_for_dp_rank(meta, 8) == "10.0.0.2"
+    assert worker._pick_host_for_dp_rank(meta, 15) == "10.0.0.2"
+
+
+def test_pick_host_for_dp_rank_single_node_fallback():
+    """When remote_hosts is None/length-1, the picker falls back to remote_host
+    so legacy single-node TP/DP=1 paths are unchanged."""
+    worker = _bare_worker()
+    meta_none = MagicMock(remote_hosts=None, remote_dp_size=8, remote_host="10.0.0.1")
+    assert worker._pick_host_for_dp_rank(meta_none, 5) == "10.0.0.1"
+
+    meta_single = MagicMock(
+        remote_hosts=["10.0.0.1"], remote_dp_size=8, remote_host="10.0.0.1"
+    )
+    assert worker._pick_host_for_dp_rank(meta_single, 5) == "10.0.0.1"
+
+
+def test_add_new_req_populates_remote_dp_rank():
+    """ReqMeta.remote_dp_rank is read from kv_transfer_params['remote_dp_rank']
+    when present, and defaults to 0 (the historical hardcoded value) when not."""
+    metadata = MoRIIOConnectorMetadata()
+    base_kv = {
+        "transfer_id": "tx-1",
+        "remote_block_ids": [0, 1, 2],
+        "remote_engine_id": "engine-A",
+        "remote_host": "10.0.0.1",
+        "remote_handshake_port": 4789,
+        "remote_notify_port": 61005,
+    }
+
+    # Case 1: proxy provided remote_dp_rank=7 — must flow through.
+    kv_with = dict(base_kv, remote_dp_rank=7)
+    metadata.add_new_req(
+        request_id="r-with",
+        local_block_ids=[10, 11],
+        kv_transfer_params=kv_with,
+        write_mode=True,
+    )
+    assert metadata.reqs_to_save["r-with"].remote_dp_rank == 7
+
+    # Case 2: proxy omitted the key — preserved historical default of 0.
+    metadata2 = MoRIIOConnectorMetadata()
+    metadata2.add_new_req(
+        request_id="r-default",
+        local_block_ids=[0],
+        kv_transfer_params=dict(base_kv),
+        write_mode=True,
+    )
+    assert metadata2.reqs_to_save["r-default"].remote_dp_rank == 0
+
+
+def test_save_kv_layer_routes_to_target_dp_rank():
+    """Regression for the hardcoded-dp0 bug: save_kv_layer must gate on the
+    target dp_rank derived from meta.remote_dp_rank, not on dp0. If the proxy
+    routes a request to decode dp_rank=7, the producer should not try to write
+    to dp0 (which was the bug before the fix)."""
+    import queue
+    import threading
+
+    worker = _bare_worker()
+    worker.is_producer = True
+    worker.mode = MoRIIOMode.WRITE
+    worker.dp_rank = 0
+    worker._handshake_lock = threading.Lock()
+    worker._ready_requests = queue.Queue()
+    # remote_engine_id used by save_kv_layer is meta.remote_host + ":" + port;
+    # set the flag so the post-loop wait exits immediately.
+    bare_engine_id = "10.0.0.1:4789"
+    worker.write_ready_flags = {bare_engine_id: True}
+    # dp7 IS registered; dp0 is NOT. With the bug, save_kv_layer would gate
+    # on dp0 and trigger a handshake. With the fix, it gates on dp7 and writes.
+    worker._remote_agents = {f"{bare_engine_id}_dp7": MagicMock()}
+    worker._write_blocks_for_req = MagicMock()
+    worker._background_moriio_handshake = MagicMock()
+
+    meta = ReqMeta(
+        transfer_id="tx-1",
+        local_block_ids=[0, 1],
+        remote_block_ids=[0, 1],
+        remote_host="10.0.0.1",
+        remote_port=4789,
+        remote_handshake_port=4789,
+        remote_notify_port=61005,
+        remote_engine_id="placeholder",
+        tp_size=1,
+        remote_dp_size=8,
+        remote_dp_rank=7,
+        remote_hosts=None,
+    )
+    md = MoRIIOConnectorMetadata()
+    md.reqs_to_save = {"r1": meta}
+
+    worker.save_kv_layer(md, "model.layers.0.self_attn.attn", torch.zeros(1))
+
+    worker._write_blocks_for_req.assert_called_once()
+    worker._background_moriio_handshake.assert_not_called()
+
+
+def test_save_kv_layer_triggers_handshake_when_target_dp_missing():
+    """Negative case: if the target dp_rank's agent has NOT been registered,
+    save_kv_layer must initiate a handshake and skip the write. Proves the
+    gate is now dp-rank-aware: dp0 being registered does not satisfy a dp7
+    target request."""
+    import queue
+    import threading
+
+    worker = _bare_worker()
+    worker.is_producer = True
+    worker.mode = MoRIIOMode.WRITE
+    worker.dp_rank = 0
+    worker._handshake_lock = threading.Lock()
+    worker._ready_requests = queue.Queue()
+    bare_engine_id = "10.0.0.1:4789"
+    # Engine-level flag set so the wait loop exits, but the dp7 agent itself
+    # is missing — only dp0 is registered.
+    worker.write_ready_flags = {bare_engine_id: True}
+    worker._remote_agents = {f"{bare_engine_id}_dp0": MagicMock()}
+    worker._write_blocks_for_req = MagicMock()
+    worker._background_moriio_handshake = MagicMock()
+
+    meta = ReqMeta(
+        transfer_id="tx-1",
+        local_block_ids=[0, 1],
+        remote_block_ids=[0, 1],
+        remote_host="10.0.0.1",
+        remote_port=4789,
+        remote_handshake_port=4789,
+        remote_notify_port=61005,
+        remote_engine_id="placeholder",
+        tp_size=1,
+        remote_dp_size=8,
+        remote_dp_rank=7,
+        remote_hosts=None,
+    )
+    md = MoRIIOConnectorMetadata()
+    md.reqs_to_save = {"r1": meta}
+
+    worker.save_kv_layer(md, "model.layers.0.self_attn.attn", torch.zeros(1))
+
+    worker._background_moriio_handshake.assert_called_once()
+    worker._write_blocks_for_req.assert_not_called()
