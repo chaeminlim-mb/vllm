@@ -371,6 +371,10 @@ class ReqMeta:
     remote_engine_id: str
     tp_size: int
     remote_dp_size: int
+    # Target peer DP rank chosen by the proxy. The producer uses this to
+    # pick the correct registered remote_agent (decode side) for each
+    # request; without it, save_kv_layer falls back to dp0 for all writes.
+    remote_dp_rank: int = 0
     # Ordered list of all prefill-instance host IPs for multi-node TP.
     # Each decode worker picks remote_hosts[tp_rank // ranks_per_node] as its
     # actual peer host for handshake + post-transfer notify. None or len<=1
@@ -410,9 +414,7 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
         # registered for finish notification (re-introduces the bug fixed by
         # 38921a7d4).
         try:
-            peer_zmq = get_peer_zmq_from_request_id(
-                request_id, is_producer=write_mode
-            )
+            peer_zmq = get_peer_zmq_from_request_id(request_id, is_producer=write_mode)
             remote_host, remote_handshake_port, remote_notify_port = (
                 parse_moriio_zmq_address(peer_zmq)
             )
@@ -461,13 +463,14 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
             remote_block_ids=kv_transfer_params["remote_block_ids"],
             remote_engine_id=kv_transfer_params["remote_engine_id"],
             remote_host=resolved_host,
-            remote_port=kv_transfer_params.get(
-                "remote_port", resolved_handshake_port
-            ),
+            remote_port=kv_transfer_params.get("remote_port", resolved_handshake_port),
             remote_handshake_port=resolved_handshake_port,
             remote_notify_port=resolved_notify_port,
-            tp_size=kv_transfer_params.get("tp_size", kv_transfer_params.get("remote_tp_size", 1)),
+            tp_size=kv_transfer_params.get(
+                "tp_size", kv_transfer_params.get("remote_tp_size", 1)
+            ),
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
+            remote_dp_rank=int(kv_transfer_params.get("remote_dp_rank", 0) or 0),
             remote_hosts=kv_transfer_params.get("remote_hosts"),
         )
         if write_mode:

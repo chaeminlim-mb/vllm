@@ -24,7 +24,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     HandshakeError,
     LayerTransferPlan,
     MoRIIOAgentMetadata,
-    MoRIIOConstants,
     MoRIIOError,
     RemoteAllocInfo,
     TransferError,
@@ -313,13 +312,16 @@ class MoRIIOWriter:
             remote_port = task.remote_notify_port + get_port_offset(
                 request_info.decode_dp_rank, self.worker.tp_rank
             )
-            # Consider using RDMA immediate data in decode side
-            # to eliminate the need for this notification.
-            # Consider including the first gen token from prefill in the notification
+            # Cross-node DP: pick the peer host that actually owns this
+            # decode dp_rank (recorded at handshake time). Falls back to
+            # the primary remote_ip when the rank-to-host map lacks an entry.
+            remote_ip = self.worker.dp_rank_to_host.get(
+                int(request_info.decode_dp_rank), task.remote_ip
+            )
 
             # Send completion notification
             self.worker.moriio_wrapper.send_notify(
-                task.transfer_id, task.remote_ip, remote_port
+                task.transfer_id, remote_ip, remote_port
             )
             # mark request as done, then we can free the blocks
             with self.worker.moriio_wrapper.lock:

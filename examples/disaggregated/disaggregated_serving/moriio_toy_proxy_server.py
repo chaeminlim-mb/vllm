@@ -60,13 +60,16 @@ def _listen_for_register(hostname, port):
         except Exception as e:
             logger.warning(
                 "malformed msgpack from %r (%d bytes): %s",
-                remote_addr, len(msg), e,
+                remote_addr,
+                len(msg),
+                e,
             )
             continue
         if not isinstance(data, dict):
             logger.warning(
                 "register payload from %r was %s, expected dict; ignoring",
-                remote_addr, type(data).__name__,
+                remote_addr,
+                type(data).__name__,
             )
             continue
         try:
@@ -98,6 +101,7 @@ def _listen_for_register(hostname, port):
                     "dp_size": data["dp_size"],
                     "tp_size": data["tp_size"],
                     "transfer_mode": data["transfer_mode"],
+                    "node_hosts": data.get("node_hosts", []),
                 }
                 # zmq_address format: "host:IP,handshake:PORT,notify:PORT"
                 # Stored verbatim; embedded into the request_id by handle_request.
@@ -146,9 +150,7 @@ def _listen_for_register(hostname, port):
                     data.get("type"),
                 )
         except Exception:
-            logger.exception(
-                "register listener iteration failed; continuing"
-            )
+            logger.exception("register listener iteration failed; continuing")
 
 
 def start_service_discovery(hostname, port):
@@ -208,7 +210,7 @@ async def send_request_to_prefill(
                 raise RuntimeError(error_message)
 
 
-async def start_decode_request(endpoint, req_data, request_id):
+async def start_decode_request(endpoint, req_data, request_id, dp_rank=None):
     session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=6 * 6000 * 6000)
     )
@@ -216,6 +218,8 @@ async def start_decode_request(endpoint, req_data, request_id):
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
     }
+    if dp_rank is not None:
+        headers["X-data-parallel-rank"] = str(dp_rank)
     response = await session.post(url=endpoint, json=req_data, headers=headers)
     return session, response
 
@@ -304,6 +308,22 @@ async def handle_request(api: str, request: Request):
             decode_instance_endpoint["tp_size"]
         )
         req_data_to_prefill["kv_transfer_params"]["transfer_id"] = transfer_id
+        # CRITICAL for wide-EP cross-node: tell prefill which decode hosts own
+        # which DP ranks. Without this, prefill blindly handshakes all 16 dp
+        # ranks against the single decode-head IP and hangs on ranks > local
+        # dp_size_per_node (their listeners live on decode-worker IP).
+        _decode_hosts = decode_instance_endpoint.get("node_hosts") or []
+        if _decode_hosts:
+            req_data_to_prefill["kv_transfer_params"]["remote_hosts"] = list(
+                _decode_hosts
+            )
+        # Tell prefill which decode DP rank to write to (symmetric DP).
+        # Without this, prefill side ReqMeta.remote_dp_rank stays 0 and
+        # every write targets decode dp0, wedging all dp>0 requests.
+        if selected_prefill_dp_rank is not None:
+            req_data_to_prefill["kv_transfer_params"]["remote_dp_rank"] = (
+                selected_prefill_dp_rank
+            )
 
         prefill_request_url = prefill_instance_endpoint["request_address"] + api
         send_prefill_task = asyncio.create_task(
@@ -315,7 +335,8 @@ async def handle_request(api: str, request: Request):
             )
         )
 
-        req_data["max_tokens"] -= 1
+        if "max_tokens" in req_data and req_data["max_tokens"]:
+            req_data["max_tokens"] -= 1
 
         req_data["kv_transfer_params"] = {
             "do_remote_decode": False,
@@ -335,7 +356,16 @@ async def handle_request(api: str, request: Request):
                 "remote_block_ids"
             ]
             req_data["kv_transfer_params"]["transfer_id"] = prefill_kv["transfer_id"]
-            req_data["kv_transfer_params"]["remote_hosts"] = prefill_kv.get("remote_hosts")
+            req_data["kv_transfer_params"]["remote_hosts"] = prefill_kv.get(
+                "remote_hosts"
+            )
+
+        # Always forward prefill_hosts to decode so add_new_req can recover
+        # peer host even on cleanup-path/short-id requests where the request_id
+        # parse fails. Required for cross-node DP and prefix-cache abort paths.
+        _prefill_hosts = prefill_instance_endpoint.get("node_hosts") or []
+        if _prefill_hosts:
+            req_data["kv_transfer_params"]["remote_hosts"] = list(_prefill_hosts)
 
         req_data["kv_transfer_params"]["remote_dp_size"] = prefill_instance_endpoint[
             "dp_size"
@@ -350,13 +380,17 @@ async def handle_request(api: str, request: Request):
 
         decode_request_url = decode_instance_endpoint["request_address"] + api
         decode_request_task = asyncio.create_task(
-            start_decode_request(decode_request_url, req_data, request_id)
+            start_decode_request(
+                decode_request_url, req_data, request_id, selected_prefill_dp_rank
+            )
         )
 
         session, decode_response = await decode_request_task
         stream_generator = stream_decode_response(session, decode_response, request_id)
         response = await make_response(stream_generator)
-        response.mimetype = "text/event-stream" if req_data.get("stream") else "application/json"
+        response.mimetype = (
+            "text/event-stream" if req_data.get("stream") else "application/json"
+        )
         return response
     except Exception as e:
         logger.exception("An error occurred while handling the request: %s", e)

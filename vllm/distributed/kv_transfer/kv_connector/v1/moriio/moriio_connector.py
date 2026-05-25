@@ -452,6 +452,20 @@ class MoRIIOConnectorScheduler:
                 )
                 remote_host, _, remote_notify_port = parse_moriio_zmq_address(peer_zmq)
 
+                # Cross-node DP fix: notification must land on the actual
+                # prefill node that owns this DP rank, not just the prefill
+                # primary host parsed from request_id. Pick from remote_hosts
+                # using the same dp-per-node math as _pick_host_for_dp_rank.
+                _remote_hosts = request.kv_transfer_params.get("remote_hosts")
+                _remote_dp_size = int(
+                    request.kv_transfer_params.get("remote_dp_size", 1) or 1
+                )
+                if _remote_hosts and len(_remote_hosts) > 1:
+                    _dp_per_node = max(1, _remote_dp_size // len(_remote_hosts))
+                    _node_idx = remote_dp_rank // _dp_per_node
+                    if 0 <= _node_idx < len(_remote_hosts):
+                        remote_host = _remote_hosts[_node_idx]
+
                 for tp_index in range(self.tp_size):
                     target_port = remote_notify_port + get_port_offset(
                         remote_dp_rank, tp_index
@@ -685,6 +699,22 @@ class MoRIIOConnectorWorker:
         self.http_port = self.moriio_config.http_port
         self.handshake_port = self.moriio_config.handshake_port
         self.notify_port = self.moriio_config.notify_port
+
+        # Multi-node DP/TP: ordered host list for this engine, mirrored from
+        # MoRIIOConnectorScheduler so _ping() can advertise it to the proxy.
+        _node_hosts_env = os.environ.get("VLLM_MORIIO_NODE_HOSTS", "").strip()
+        if _node_hosts_env:
+            self.node_hosts = [
+                h.strip() for h in _node_hosts_env.split(",") if h.strip()
+            ]
+        else:
+            self.node_hosts = [self.local_ip]
+
+        # Cross-node DP: maps remote dp_rank -> actual peer host. Populated by
+        # _moriio_handshake. Writers consult this to route the completion notify
+        # back to the host that actually owns each consumer DP rank, rather
+        # than the primary host parsed from request_id.
+        self.dp_rank_to_host: dict[int, str] = {}
 
         self.zmq_context = zmq.Context()
         self.metadata_address = (
@@ -933,6 +963,10 @@ class MoRIIOConnectorWorker:
                         # READ (prefill-then-decode, sequential) from WRITE (concurrent)
                         # scheduling.
                         "transfer_mode": self.mode.name,
+                        # node_hosts: full ordered list of node IPs for this engine
+                        # (from VLLM_MORIIO_NODE_HOSTS). Needed by proxy to forward
+                        # to the peer side for cross-node DP=N handshake routing.
+                        "node_hosts": list(getattr(self, "node_hosts", [])),
                     }
 
                     sock.send(msgpack.dumps(data))
@@ -1079,6 +1113,9 @@ class MoRIIOConnectorWorker:
             remote_agent_name = self.moriio_wrapper.register_remote_engine(
                 metadata.agent_metadata
             )
+            # Remember which host hosts this dp_rank so the writer can
+            # route the completion notify to the right node.
+            self.dp_rank_to_host[int(remote_dp_rank)] = host
 
             logger.debug(
                 "MoRIIO handshake: registered"
@@ -1138,6 +1175,26 @@ class MoRIIOConnectorWorker:
                 return meta.remote_hosts[node_idx]
         return meta.remote_host
 
+    def _pick_host_for_dp_rank(self, meta: ReqMeta, dp_rank: int) -> str:
+        """Pick the remote host for a given remote DP rank.
+
+        For wide-EP DP=N cross-node (e.g. DP=16 across 2 nodes), each remote
+        node hosts a contiguous slice of the dp ranks: node 0 owns dp ranks
+        [0, dp_per_node), node 1 owns [dp_per_node, 2*dp_per_node), etc.
+        Without this, _background_moriio_handshake blindly handshakes all 16
+        dp ranks against the single decode-head IP and hangs on ranks
+        >= dp_per_node (their listeners live on decode-worker IP).
+        """
+        if meta.remote_hosts and len(meta.remote_hosts) > 1:
+            dp_per_node = max(
+                1,
+                int(meta.remote_dp_size) // len(meta.remote_hosts),
+            )
+            node_idx = dp_rank // dp_per_node
+            if 0 <= node_idx < len(meta.remote_hosts):
+                return meta.remote_hosts[node_idx]
+        return meta.remote_host
+
     def _background_moriio_handshake(
         self, req_id: ReqId, remote_engine_id: EngineId, meta: ReqMeta
     ):
@@ -1146,9 +1203,6 @@ class MoRIIOConnectorWorker:
         if remote_engine_id is not None:
             fut = self._handshake_futures.get(remote_engine_id)
         if fut is None:
-            # Multi-node TP: pick the producer host for this worker's tp_rank.
-            # For single-node TP this returns meta.remote_host unchanged.
-            host = self._pick_remote_host(meta)
             port = int(meta.remote_handshake_port)
             tp_size = int(meta.tp_size)
             remote_dp_size = int(meta.remote_dp_size)
@@ -1165,8 +1219,18 @@ class MoRIIOConnectorWorker:
 
         for cur_dp_rank in range(remote_dp_size):
             dp_engine_id = self.get_engine_name_with_dp(remote_engine_id, cur_dp_rank)
+            # Wide-EP cross-node: each dp_rank's listener lives on a specific
+            # node (rank 0..dp_per_node-1 on host[0], next slice on host[1],
+            # etc.). Use the per-dp-rank picker; falls back to single-host for
+            # the legacy TP cross-node case.
+            cur_host = self._pick_host_for_dp_rank(meta, cur_dp_rank)
             future = self._handshake_initiation_executor.submit(
-                self._moriio_handshake, host, port, tp_size, dp_engine_id, cur_dp_rank
+                self._moriio_handshake,
+                cur_host,
+                port,
+                tp_size,
+                dp_engine_id,
+                cur_dp_rank,
             )
             fut_list.append(future)
 
@@ -1424,22 +1488,31 @@ class MoRIIOConnectorWorker:
         remote_engine_id = None
 
         for req_id, meta in metadata.reqs_to_save.items():
-            # we only need to check if dp0 in rank
             remote_engine_id = (
                 str(meta.remote_host) + ":" + str(meta.remote_handshake_port)
             )
 
             meta.remote_engine_id = remote_engine_id
 
-            dp0_remote_engine_id = self.get_engine_name_with_dp(remote_engine_id, 0)
-            if dp0_remote_engine_id not in self._remote_agents:
+            # Route to the correct consumer DP rank chosen by the proxy.
+            # Hardcoding dp0 sends every write to a single decode rank and
+            # wedges the system once requests target dp_rank != 0.
+            # Prefer explicit remote_dp_rank from kv_transfer_params; fall
+            # back to the producer worker's own dp_rank for symmetric DP
+            # (proxy lacking remote_dp_rank for prefill would otherwise pin
+            # all writes to dp0).
+            _meta_dp_rank = getattr(meta, "remote_dp_rank", 0)
+            target_dp_rank = int(_meta_dp_rank) if _meta_dp_rank else int(self.dp_rank)
+            target_remote_engine_id = self.get_engine_name_with_dp(
+                remote_engine_id, target_dp_rank
+            )
+            if target_remote_engine_id not in self._remote_agents:
                 # Initiate handshake with remote engine to exchange metadata.
                 with self._handshake_lock:
-                    if remote_engine_id not in self._remote_agents:
+                    if target_remote_engine_id not in self._remote_agents:
                         self._background_moriio_handshake(
                             req_id, remote_engine_id, meta
                         )
-
                         continue
             self._write_blocks_for_req(req_id, meta, layer_name, kv_layer)
 
