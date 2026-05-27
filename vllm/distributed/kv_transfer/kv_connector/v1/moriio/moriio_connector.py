@@ -187,6 +187,7 @@ class MoRIIOConnector(KVConnectorBase_V1):
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         if self.mode == MoRIIOMode.WRITE and get_role() == ROLE.CONSUMER:
+            assert isinstance(self._connector_metadata, MoRIIOConnectorMetadata)
             self.connector_worker.moriio_wrapper.async_wait_reqid()
 
         assert isinstance(self._connector_metadata, MoRIIOConnectorMetadata)
@@ -854,6 +855,13 @@ class MoRIIOConnectorWorker:
             use_mla=self.use_mla,
         )
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
+        # PR #40344 race fix: WRITE-mode completion notifications can arrive
+        # before transfer_id_to_request_id is populated for that transfer_id.
+        # Buffer unmatched completions here so subsequent get_finished() calls
+        # can re-match them once the mapping is established by start_load_kv.
+        # Without this, wide-TP completions race ahead of metadata broadcast
+        # and decode requests stay in WAITING_FOR_REMOTE_KVS indefinitely.
+        self._unmatched_write_completions: set[str] = set()
 
         # TODO: consider the integration of flashinfer or other backends.
         self.backend_name = backend.get_name()
@@ -1176,23 +1184,32 @@ class MoRIIOConnectorWorker:
         return meta.remote_host
 
     def _pick_host_for_dp_rank(self, meta: ReqMeta, dp_rank: int) -> str:
-        """Pick the remote host for a given remote DP rank.
+        """Pick the remote host for a given peer (dp_rank, tp_rank).
 
-        For wide-EP DP=N cross-node (e.g. DP=16 across 2 nodes), each remote
-        node hosts a contiguous slice of the dp ranks: node 0 owns dp ranks
-        [0, dp_per_node), node 1 owns [dp_per_node, 2*dp_per_node), etc.
-        Without this, _background_moriio_handshake blindly handshakes all 16
-        dp ranks against the single decode-head IP and hangs on ranks
-        >= dp_per_node (their listeners live on decode-worker IP).
+        Two cross-node topologies are supported:
+
+        * Wide-DP/EP (remote_dp_size >= len(remote_hosts)): each remote node
+          owns a contiguous slice of dp ranks (dp 0..dp_per_node-1 on
+          remote_hosts[0], next slice on remote_hosts[1], ...).
+        * Wide-TP (remote_dp_size < len(remote_hosts) and tp_size spans the
+          hosts): each remote node owns a contiguous slice of tp ranks.
+          In symmetric TP this worker's tp_rank == the peer's tp_rank, so
+          we defer to _pick_remote_host which slices by self.tp_rank.
+
+        Without this routing, _background_moriio_handshake blindly hits the
+        primary remote host for every (dp, tp) and hangs on whichever ranks
+        live on the secondary node.
         """
         if meta.remote_hosts and len(meta.remote_hosts) > 1:
-            dp_per_node = max(
-                1,
-                int(meta.remote_dp_size) // len(meta.remote_hosts),
-            )
-            node_idx = dp_rank // dp_per_node
-            if 0 <= node_idx < len(meta.remote_hosts):
-                return meta.remote_hosts[node_idx]
+            n_hosts = len(meta.remote_hosts)
+            # Wide-DP/EP: peer dp_rank space spans the host list.
+            if int(meta.remote_dp_size) >= n_hosts:
+                dp_per_node = max(1, int(meta.remote_dp_size) // n_hosts)
+                node_idx = dp_rank // dp_per_node
+                if 0 <= node_idx < n_hosts:
+                    return meta.remote_hosts[node_idx]
+            # Wide-TP fallback: peer tp_rank space spans the host list.
+            return self._pick_remote_host(meta)
         return meta.remote_host
 
     def _background_moriio_handshake(
@@ -1409,20 +1426,37 @@ class MoRIIOConnectorWorker:
 
         else:
             if self.mode == MoRIIOMode.WRITE:
-                done_recving = self.moriio_wrapper.pop_finished_write_req_ids()
+                fresh = self.moriio_wrapper.pop_finished_write_req_ids()
+                # PR #40344 race fix: accumulate completions that arrived
+                # before their transfer_id was registered in the mapping.
+                # Wide-TP exposes this race because completion notifications
+                # from prefill can outrun the decode-side metadata broadcast
+                # that establishes the transfer_id->request_id mapping.
+                self._unmatched_write_completions |= fresh
+                done_recving = self._unmatched_write_completions
             else:
                 done_recving = self._pop_done_transfers()
 
         # Translate consumer-side done_recving (transfer_ids reported by the
         # producer via send_notify in WRITE mode) back to the consumer's own
-        # internal request_ids. Pop on success so the persistent worker map
-        # (populated incrementally in start_load_kv) does not grow unbounded.
-        translated_recving: set[str] = set()
-        for tid in done_recving:
-            mapped = self.transfer_id_to_request_id.pop(tid, None)
-            if mapped is not None:
-                translated_recving.add(mapped)
-        done_recving = translated_recving
+        # internal request_ids. For WRITE mode use the unmatched-accumulator
+        # pattern: match what we can, leave the rest for the next iteration.
+        # For READ mode keep the original pop-on-success semantics.
+        if not self.is_producer and self.mode == MoRIIOMode.WRITE:
+            matched_tids = {
+                tid
+                for tid in self._unmatched_write_completions
+                if tid in self.transfer_id_to_request_id
+            }
+            done_recving = {self.transfer_id_to_request_id[tid] for tid in matched_tids}
+            self._unmatched_write_completions -= matched_tids
+        else:
+            translated_recving: set[str] = set()
+            for tid in done_recving:
+                mapped = self.transfer_id_to_request_id.pop(tid, None)
+                if mapped is not None:
+                    translated_recving.add(mapped)
+            done_recving = translated_recving
 
         return done_sending, done_recving
 
