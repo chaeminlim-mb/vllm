@@ -917,6 +917,53 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             histogram_decode_time_request, per_engine_labelvalues
         )
 
+        # PD 5-stage breakdown — D-side only. Populated by request_state_stats
+        # for requests that completed a KV transfer from a remote prefill node
+        # (see RequestStateStats.kv_xfer_complete_ts / remote_prefill_complete_ts).
+        # Stage 3: kv_xfer_time = kv_xfer_complete_ts(D) - remote_prefill_complete_ts(P).
+        #   Cross-node delta; requires NTP-synced wall-clock on both nodes.
+        # Stage 4: decode_queue_time_post_kv = scheduled_ts(D) - kv_xfer_complete_ts(D).
+        # Stage 5: decode_exec_time_post_kv = last_token_ts(D) - scheduled_ts(D).
+        histogram_kv_xfer_time = self._histogram_cls(
+            name="vllm:request_kv_xfer_time_seconds",
+            documentation=(
+                "Histogram of KV transfer time per request (D-side). "
+                "kv_xfer_complete_ts(D) - remote_prefill_complete_ts(P). "
+                "PD READ-mode only; requires NTP-synced wall-clock."
+            ),
+            buckets=request_latency_buckets,
+            labelnames=labelnames,
+        )
+        self.histogram_kv_xfer_time_request = create_metric_per_engine(
+            histogram_kv_xfer_time, per_engine_labelvalues
+        )
+
+        histogram_decode_queue_post_kv = self._histogram_cls(
+            name="vllm:request_decode_queue_time_post_kv_seconds",
+            documentation=(
+                "Histogram of D-side queue time after KV transfer completes. "
+                "scheduled_ts(D) - kv_xfer_complete_ts(D)."
+            ),
+            buckets=request_latency_buckets,
+            labelnames=labelnames,
+        )
+        self.histogram_decode_queue_time_post_kv_request = create_metric_per_engine(
+            histogram_decode_queue_post_kv, per_engine_labelvalues
+        )
+
+        histogram_decode_exec_post_kv = self._histogram_cls(
+            name="vllm:request_decode_exec_time_post_kv_seconds",
+            documentation=(
+                "Histogram of D-side exec time after scheduling post-KV. "
+                "last_token_ts(D) - scheduled_ts(D)."
+            ),
+            buckets=request_latency_buckets,
+            labelnames=labelnames,
+        )
+        self.histogram_decode_exec_time_post_kv_request = create_metric_per_engine(
+            histogram_decode_exec_post_kv, per_engine_labelvalues
+        )
+
         histogram_prefill_kv_computed_request = self._histogram_cls(
             name="vllm:request_prefill_kv_computed_tokens",
             documentation=(
@@ -1194,6 +1241,23 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.histogram_decode_time_request[engine_idx].observe(
                 finished_request.decode_time
             )
+            # PD breakdown — only observe nonzero values, since these are
+            # populated only on D-side requests that came via remote prefill.
+            # Negative deltas (clock skew across nodes for stage 3) are
+            # clamped to zero so the histogram stays sane; the raw timestamps
+            # remain in RequestStateStats for offline forensic checks.
+            if finished_request.kv_xfer_time > 0.0:
+                self.histogram_kv_xfer_time_request[engine_idx].observe(
+                    finished_request.kv_xfer_time
+                )
+            if finished_request.decode_queue_time_post_kv > 0.0:
+                self.histogram_decode_queue_time_post_kv_request[
+                    engine_idx
+                ].observe(finished_request.decode_queue_time_post_kv)
+            if finished_request.decode_exec_time_post_kv > 0.0:
+                self.histogram_decode_exec_time_post_kv_request[
+                    engine_idx
+                ].observe(finished_request.decode_exec_time_post_kv)
             # Calculate prefill KV compute (excludes cached tokens)
             prefill_kv_computed = finished_request.num_prompt_tokens - max(
                 finished_request.num_cached_tokens, 0

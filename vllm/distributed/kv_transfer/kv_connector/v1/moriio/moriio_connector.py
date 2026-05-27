@@ -1390,6 +1390,12 @@ class MoRIIOConnectorWorker:
         to track which workers are done.
         """
 
+        # Pull any pending notify frames from the relay subprocess stdout.
+        # Replaces the legacy Python notify-listener thread (see moriio_engine
+        # async_wait_reqid / drain_notify_pipe). Synchronous drain at sched
+        # step boundary → no Python-thread GIL contention with torch.profiler.
+        self.moriio_wrapper.drain_notify_pipe()
+
         done_sending, done_recving = set(), set()
 
         if self.is_producer:
@@ -1615,6 +1621,10 @@ class MoRIIOConnectorWorker:
         Start loading by triggering non-blocking moriio_xfer.
         We check for these trnxs to complete in each step().
         """
+        # Drain notify frames first so any handshake-completion or KV-ready
+        # messages that arrived between scheduler steps are processed before
+        # we decide whether to wait on the handshake busy-loop below.
+        self.moriio_wrapper.drain_notify_pipe()
         # Merge (rather than overwrite) so the worker-side mapping survives
         # after the scheduler-side request_finished() unmaps a transfer_id.
         # The producer needs this entry to translate the consumer's

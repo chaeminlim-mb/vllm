@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import base64
+import fcntl
+import os
+import subprocess
+import sys
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -406,7 +411,17 @@ class MoRIIOWrapper:
         self._qp_per_transfer = envs.VLLM_MORIIO_QP_PER_TRANSFER
         self._post_batch_size = envs.VLLM_MORIIO_POST_BATCH_SIZE
         self._num_worker_threads = envs.VLLM_MORIIO_NUM_WORKERS
+        # Notify-listener: kept as a None-typed slot so legacy `if self.notify_thread`
+        # checks still pass. The actual listener lives in a SUBPROCESS now
+        # (notify_proc) to escape Python-thread GIL contention with the vLLM
+        # worker under torch.profiler. See async_wait_reqid + drain_notify_pipe.
         self.notify_thread: threading.Thread | None = None
+        self.notify_proc: subprocess.Popen | None = None
+        # Buffer for partial newline-delimited frames coming back from the
+        # relay subprocess stdout. drain_notify_pipe splits on '\n', stashes
+        # any trailing partial here, base64-decodes complete frames, and
+        # feeds each into _handle_message.
+        self._notify_recv_buf: bytearray = bytearray()
         self.sessions: list[IOEngine.Session] = []
         self.paths: dict[str, zmq.Socket] = {}
 
@@ -558,29 +573,100 @@ class MoRIIOWrapper:
             )
 
     def async_wait_reqid(self):
+        """Ensure the notify-listener relay subprocess is running.
+
+        Spawned ONCE per engine. The subprocess (util_profiler/moriio_notify_relay.py)
+        owns the ZMQ ROUTER socket on `self.notify_port`, forwards each received
+        message payload as a line-delimited base64 frame on stdout. The vLLM
+        worker drains stdout synchronously at scheduler-step boundaries via
+        drain_notify_pipe() — no Python listener thread, so torch.profiler-driven
+        GIL contention on the worker process cannot starve notification handling.
+
+        Path resolution: VLLM_MORIIO_NOTIFY_RELAY_PATH env override, else
+        /util_profiler/moriio_notify_relay.py (default container mount).
+        """
         assert self.notify_port is not None, "Notify port cannot be None"
 
-        if self.notify_thread is not None:
+        if self.notify_proc is not None and self.notify_proc.poll() is None:
             return
 
-        def _async_wait():
-            host = "*"
-            path = make_zmq_path("tcp", host, self.notify_port)
-            logger.info("Node starting to listen notify from path = %s", path)
-
-            with zmq_ctx(zmq.ROUTER, path) as sock:
-                while True:
-                    try:
-                        identity, msg = sock.recv_multipart()
-                        self._handle_message(msg)
-                    except Exception as e:
-                        logger.error("Error processing message: %s", e)
-                        raise HandshakeError(f"Error processing message: {e}") from e
-
-        self.notify_thread = threading.Thread(
-            target=_async_wait, daemon=True, name="moriio-notify-listener"
+        relay_path = os.environ.get(
+            "VLLM_MORIIO_NOTIFY_RELAY_PATH",
+            "/util_profiler/moriio_notify_relay.py",
         )
-        self.notify_thread.start()
+        if not os.path.isfile(relay_path):
+            raise HandshakeError(
+                f"MoRI notify relay script not found at {relay_path}. "
+                "Set VLLM_MORIIO_NOTIFY_RELAY_PATH or bind-mount util_profiler/."
+            )
+
+        logger.info(
+            "MoRI notify relay spawning: %s --port %d",
+            relay_path,
+            self.notify_port,
+        )
+        # bufsize=0 → unbuffered stdout pipe, so drain sees frames immediately.
+        # stderr → DEVNULL keeps the relay's logging out of the worker stream;
+        # flip to PIPE during debugging if needed.
+        self.notify_proc = subprocess.Popen(
+            [sys.executable, relay_path, "--port", str(self.notify_port)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+            close_fds=True,
+        )
+        # Make stdout non-blocking so drain_notify_pipe can read whatever's
+        # available without blocking the scheduler step.
+        fd = self.notify_proc.stdout.fileno()
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    def drain_notify_pipe(self) -> int:
+        """Drain pending notify frames from the relay subprocess stdout.
+
+        Called per scheduler step (from MoRIIOConnectorWorker.get_finished /
+        start_load_kv). Non-blocking read, splits on '\\n', base64-decodes each
+        complete frame, dispatches via _handle_message. Returns number of
+        messages handled this call.
+
+        If the relay subprocess died, this is a no-op and logs a warning.
+        """
+        if self.notify_proc is None:
+            return 0
+        if self.notify_proc.poll() is not None:
+            # Subprocess died; the engine is hosed. Log and bail.
+            logger.warning(
+                "MoRI notify relay subprocess exited (rc=%s); notifications "
+                "will not be delivered.",
+                self.notify_proc.returncode,
+            )
+            return 0
+
+        try:
+            chunk = self.notify_proc.stdout.read()
+        except BlockingIOError:
+            return 0
+        if not chunk:
+            return 0
+
+        self._notify_recv_buf.extend(chunk)
+        # Split on newlines; last segment may be partial → keep buffered.
+        lines = self._notify_recv_buf.split(b"\n")
+        self._notify_recv_buf = bytearray(lines[-1])
+        handled = 0
+        for b64_line in lines[:-1]:
+            if not b64_line:
+                continue
+            try:
+                payload = base64.b64decode(b64_line)
+                self._handle_message(payload)
+                handled += 1
+            except Exception as e:
+                logger.exception(
+                    "MoRI notify relay: failed to handle message: %s", e
+                )
+        return handled
 
     def _handle_message(self, msg: bytes):
         """Handles incoming messages from remote nodes."""
