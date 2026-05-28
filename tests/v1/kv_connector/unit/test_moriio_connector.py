@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOConstants,
     MoRIIOMode,
     ReqMeta,
+    get_port_offset,
     zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
@@ -604,6 +605,45 @@ def _bare_worker():
     return MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
 
 
+def test_read_mode_trims_remote_blocks_not_local_blocks():
+    """If prefill returns more blocks than decode allocated, trim remote ids.
+
+    Regression guard for a READ-mode bug where the decode-side local block list
+    was overwritten with remote block ids, causing MoRIIO reads to target wrong
+    local cache offsets.
+    """
+    vllm_config = create_vllm_config(role="kv_consumer", read_mode=True)
+    scheduler = create_scheduler(vllm_config)
+
+    block_size = vllm_config.cache_config.block_size
+    request = create_request(
+        request_id=1,
+        block_size=block_size,
+        num_tokens=int(block_size * 2.5),
+        do_remote_decode=False,
+        do_remote_prefill=True,
+    )
+    request = _setup_kv_transfer_request(request)
+    request_id = request.request_id
+
+    scheduler.add_request(request)
+    local_blocks = scheduler.kv_cache_manager.coordinator.single_type_managers[
+        0
+    ].req_to_blocks[request_id]
+    local_block_ids = [block.block_id for block in local_blocks]
+
+    remote_block_ids = [1000, 1001] + list(range(2000, 2000 + len(local_blocks)))
+    request.kv_transfer_params["remote_block_ids"] = remote_block_ids
+
+    scheduler_output = scheduler.schedule()
+    kv_connector_metadata = scheduler_output.kv_connector_metadata
+    assert kv_connector_metadata is not None
+    req_meta = kv_connector_metadata.reqs_to_recv[request_id]
+
+    assert req_meta.local_block_ids == local_block_ids
+    assert req_meta.remote_block_ids == remote_block_ids[-len(local_blocks) :]
+
+
 def test_pick_host_for_dp_rank_cross_node():
     """dp_rank slices the remote node list when remote_hosts has >1 entry."""
     worker = _bare_worker()
@@ -664,6 +704,75 @@ def test_add_new_req_populates_remote_dp_rank():
         write_mode=True,
     )
     assert metadata2.reqs_to_save["r-default"].remote_dp_rank == 0
+
+
+def test_read_blocks_uses_remote_dp_session_and_notify_port():
+    """READ mode must use target remote_dp_rank for session and callback port."""
+    import threading
+    from collections import defaultdict
+
+    worker = _bare_worker()
+    worker.mode = MoRIIOMode.READ
+    worker.dp_rank = 3
+    worker.tp_rank = 0
+    worker.layer_name_to_local_kv_cache_metadata = {
+        "layer0": object(),
+        "layer1": object(),
+    }
+    worker._recving_transfers = defaultdict(list)
+    worker._recving_transfers_callback_addr = {}
+    worker.moriio_wrapper = MagicMock()
+    worker.moriio_wrapper.lock = threading.Lock()
+    worker.moriio_wrapper.read_remote_data.side_effect = ["status0", "status1"]
+    worker._get_built_session = MagicMock(return_value=(["sess0", "sess1"], object()))
+    worker._compute_block_transfer_offsets = MagicMock(return_value=([10], [20], [30]))
+
+    worker._read_blocks(
+        local_block_ids=[1],
+        remote_block_ids=[9],
+        dst_engine_id="10.0.0.1:4789",
+        request_id="req-1",
+        remote_host="10.0.0.2",
+        remote_notify_port=61005,
+        remote_dp_rank=7,
+        remote_tp_size=1,
+    )
+
+    worker._get_built_session.assert_called_once_with("10.0.0.1:4789_dp7")
+    assert worker._recving_transfers["req-1"] == ["status0", "status1"]
+    assert worker._recving_transfers_callback_addr["req-1"] == (
+        "10.0.0.2",
+        str(61005 + get_port_offset(7, 0, 1)),
+    )
+
+
+def test_read_blocks_for_req_routes_notify_host_by_remote_dp_rank():
+    """Wide-EP READ notify host must follow remote_dp_rank, not tp_rank only."""
+    worker = _bare_worker()
+    worker.dp_rank = 9
+    worker.tp_rank = 0
+    worker._read_blocks = MagicMock()
+
+    meta = ReqMeta(
+        transfer_id="tx-1",
+        local_block_ids=[0],
+        remote_block_ids=[10],
+        remote_host="10.0.0.1",
+        remote_port=4789,
+        remote_handshake_port=4789,
+        remote_notify_port=61005,
+        remote_engine_id="10.0.0.1:4789",
+        tp_size=1,
+        remote_dp_size=16,
+        remote_dp_rank=9,
+        remote_hosts=["10.0.0.1", "10.0.0.2"],
+    )
+
+    worker._read_blocks_for_req("req-1", meta)
+
+    worker._read_blocks.assert_called_once()
+    assert worker._read_blocks.call_args.kwargs["remote_host"] == "10.0.0.2"
+    assert worker._read_blocks.call_args.kwargs["remote_dp_rank"] == 9
 
 
 def test_save_kv_layer_routes_to_target_dp_rank():

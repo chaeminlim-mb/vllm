@@ -70,6 +70,17 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+_MORIIO_DEBUG = os.environ.get("VLLM_MORIIO_DEBUG", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _dbg(msg: str, *args: Any) -> None:
+    if _MORIIO_DEBUG:
+        logger.info("[WIDEPD-DBG] %s", msg % args if args else msg)
+
 
 try:
     from mori.io import (
@@ -406,14 +417,29 @@ class MoRIIOConnectorScheduler:
                         # a full prefix cache hit on the D worker. We need to call
                         # send_notify in _read_blocks to free the memory on the P.
 
-                        # Get unhashed blocks to pull from remote.
+                        # Get local blocks to pull remote KV into. If the
+                        # prefill side returns more remote blocks than decode
+                        # allocated locally (prefix-hit / partial-local case),
+                        # trim the REMOTE list to the suffix that maps onto the
+                        # local blocks. Do not overwrite local_block_ids with
+                        # remote IDs: _compute_block_transfer_offsets expects
+                        # local_block_ids to index the local decode cache.
                         local_block_ids = blocks.get_block_ids()[0]
                         assert len(local_block_ids) <= len(remote_block_ids)
-                        if len(local_block_ids) == len(remote_block_ids):
-                            pass
-                        else:
-                            local_block_ids = remote_block_ids[-len(local_block_ids) :]
+                        if len(local_block_ids) != len(remote_block_ids):
+                            remote_block_ids = remote_block_ids[-len(local_block_ids) :]
+                            params["remote_block_ids"] = remote_block_ids
 
+                        _dbg(
+                            "READ alloc req=%s transfer=%s remote_dp_rank=%s "
+                            "local_blocks=%s remote_blocks=%s remote_hosts=%s",
+                            request.request_id,
+                            params.get("transfer_id"),
+                            params.get("remote_dp_rank", 0),
+                            len(local_block_ids),
+                            len(remote_block_ids),
+                            params.get("remote_hosts"),
+                        )
                         self._reqs_need_recv[request.request_id] = (
                             request,
                             local_block_ids,
@@ -1241,6 +1267,22 @@ class MoRIIOConnectorWorker:
             # etc.). Use the per-dp-rank picker; falls back to single-host for
             # the legacy TP cross-node case.
             cur_host = self._pick_host_for_dp_rank(meta, cur_dp_rank)
+            _dbg(
+                "handshake route req=%s local_dp=%s local_tp=%s remote_dp=%s "
+                "remote_engine=%s host=%s port=%s remote_hosts=%s "
+                "remote_dp_size=%s tp_size=%s mode=%s",
+                req_id,
+                self.dp_rank,
+                self.tp_rank,
+                cur_dp_rank,
+                dp_engine_id,
+                cur_host,
+                port,
+                meta.remote_hosts,
+                remote_dp_size,
+                tp_size,
+                self.mode,
+            )
             future = self._handshake_initiation_executor.submit(
                 self._moriio_handshake,
                 cur_host,
@@ -1495,10 +1537,23 @@ class MoRIIOConnectorWorker:
                         )
                         to_remove.append(req_id)
                         continue
+                    callback_host, callback_port = (
+                        self._recving_transfers_callback_addr[req_id]
+                    )
+                    _dbg(
+                        "READ done notify req=%s transfer=%s src_dp=%s src_tp=%s "
+                        "notify=%s:%s",
+                        req_id,
+                        transfer_id,
+                        self.dp_rank,
+                        self.tp_rank,
+                        callback_host,
+                        callback_port,
+                    )
                     self.moriio_wrapper.send_notify(
                         transfer_id,
-                        self._recving_transfers_callback_addr[req_id][0],
-                        self._recving_transfers_callback_addr[req_id][1],
+                        callback_host,
+                        callback_port,
                     )
                     to_remove.append(req_id)
             for req_id in to_remove:
@@ -1596,11 +1651,22 @@ class MoRIIOConnectorWorker:
                 str(meta.remote_host) + ":" + str(meta.remote_handshake_port)
             )
             meta.remote_engine_id = remote_engine_id
-            dp0_remote_engine_id = self.get_engine_name_with_dp(remote_engine_id, 0)
-            if dp0_remote_engine_id not in self._remote_agents:
+            target_remote_engine_id = self.get_engine_name_with_dp(
+                remote_engine_id, int(meta.remote_dp_rank)
+            )
+            if target_remote_engine_id not in self._remote_agents:
                 # Initiate handshake with remote engine to exchange metadata.
                 with self._handshake_lock:
-                    if remote_engine_id not in self._remote_agents:
+                    if target_remote_engine_id not in self._remote_agents:
+                        _dbg(
+                            "READ handshake needed req=%s target_engine=%s "
+                            "remote_dp_rank=%s local_dp=%s local_tp=%s",
+                            req_id,
+                            target_remote_engine_id,
+                            meta.remote_dp_rank,
+                            self.dp_rank,
+                            self.tp_rank,
+                        )
                         self._background_moriio_handshake(
                             req_id, remote_engine_id, meta
                         )
@@ -1636,13 +1702,31 @@ class MoRIIOConnectorWorker:
             meta.remote_engine_id,
             req_id,
         )
-        # Multi-node TP: remote_host here is used by _read_blocks to record the
-        # post-transfer notify callback address (so prefill can free its KV
-        # blocks). For multi-node prefill the notify must go to the prefill
-        # node that actually owns this worker's KV slice, not the prefill
-        # head. _pick_remote_host returns meta.remote_host unchanged for
-        # single-host setups, preserving TP=8 / monolithic behaviour.
-        actual_remote_host = self._pick_remote_host(meta)
+        # Multi-node TP/DP: remote_host here records the post-transfer notify
+        # callback address (so prefill can free its KV blocks). The notify must
+        # go to the prefill node that owns the remote (dp_rank, tp_rank) slice,
+        # not always the prefill head.
+        actual_remote_host = self._pick_host_for_dp_rank(meta, int(meta.remote_dp_rank))
+        _dbg(
+            "READ start req=%s transfer=%s local_dp=%s local_tp=%s "
+            "remote_dp_rank=%s remote_dp_size=%s tp_size=%s remote_engine=%s "
+            "remote_host=%s picked_host=%s notify_port=%s local_blocks=%s "
+            "remote_blocks=%s remote_hosts=%s",
+            req_id,
+            meta.transfer_id,
+            self.dp_rank,
+            self.tp_rank,
+            meta.remote_dp_rank,
+            meta.remote_dp_size,
+            meta.tp_size,
+            meta.remote_engine_id,
+            meta.remote_host,
+            actual_remote_host,
+            meta.remote_notify_port,
+            len(meta.local_block_ids),
+            len(meta.remote_block_ids),
+            meta.remote_hosts,
+        )
         self._read_blocks(
             request_id=req_id,
             dst_engine_id=meta.remote_engine_id,
@@ -1650,6 +1734,8 @@ class MoRIIOConnectorWorker:
             remote_block_ids=meta.remote_block_ids,
             remote_host=actual_remote_host,
             remote_notify_port=meta.remote_notify_port,
+            remote_dp_rank=int(meta.remote_dp_rank),
+            remote_tp_size=int(meta.tp_size),
         )
 
     def _write_blocks_for_req(self, req_id: ReqId, meta: ReqMeta, layer_name, kv_layer):
@@ -1804,12 +1890,36 @@ class MoRIIOConnectorWorker:
         request_id: str,
         remote_host: str,
         remote_notify_port: int,
+        remote_dp_rank: int = 0,
+        remote_tp_size: int = 1,
     ) -> None:
         if self.mode == MoRIIOMode.WRITE:
             return
 
-        dp0_engine_id = self.get_engine_name_with_dp(dst_engine_id, 0)
-        sessions, remote_moriio_meta = self._get_built_session(dp0_engine_id)
+        target_engine_id = self.get_engine_name_with_dp(dst_engine_id, remote_dp_rank)
+        sessions, remote_moriio_meta = self._get_built_session(target_engine_id)
+        callback_port = str(
+            remote_notify_port
+            + get_port_offset(remote_dp_rank, self.tp_rank, remote_tp_size)
+        )
+        _dbg(
+            "READ blocks req=%s local_dp=%s local_tp=%s remote_dp_rank=%s "
+            "remote_tp_size=%s dst_engine=%s session_engine=%s remote_host=%s "
+            "callback=%s:%s local_blocks=%s remote_blocks=%s layers=%s",
+            request_id,
+            self.dp_rank,
+            self.tp_rank,
+            remote_dp_rank,
+            remote_tp_size,
+            dst_engine_id,
+            target_engine_id,
+            remote_host,
+            remote_host,
+            callback_port,
+            len(local_block_ids),
+            len(remote_block_ids),
+            len(self.layer_name_to_local_kv_cache_metadata),
+        )
 
         first_layer = list(self.layer_name_to_local_kv_cache_metadata.keys())[0]
         offs = self._compute_block_transfer_offsets(
@@ -1828,5 +1938,5 @@ class MoRIIOConnectorWorker:
                 self._recving_transfers[request_id].append(transfer_status)
                 self._recving_transfers_callback_addr[request_id] = (
                     remote_host,
-                    str(remote_notify_port + self.tp_rank),
+                    callback_port,
                 )
