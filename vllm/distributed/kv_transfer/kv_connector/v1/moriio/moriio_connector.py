@@ -800,7 +800,17 @@ class MoRIIOConnectorWorker:
             transfer_timeout=self.moriio_config.transfer_timeout,
         )
         self.moriio_wrapper.set_moriio_engine(self.moriio_engine)
-        self.moriio_wrapper.set_backend_type(BackendType.RDMA)
+        # #40344 wired set_backend_type to thread qp/batch/worker config from
+        # MoRIIOConfig instead of env-var initialization. Pass them explicitly
+        # so the upstream fix actually takes effect (default kwargs would
+        # silently fall back to qp=1, batch=-1, workers=1 regardless of
+        # MoRIIOConfig values).
+        self.moriio_wrapper.set_backend_type(
+            BackendType.RDMA,
+            qp_per_transfer=self.moriio_config.qp_per_transfer,
+            post_batch_size=self.moriio_config.post_batch_size,
+            num_workers=self.moriio_config.num_workers,
+        )
         self.moriio_wrapper.notify_port = self.moriio_config.notify_port
         self.local_kv_cache_metadata: list[bytes] = []
         self.local_kv_cache_size: list[int] = []
