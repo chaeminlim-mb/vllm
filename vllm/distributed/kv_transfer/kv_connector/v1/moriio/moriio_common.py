@@ -162,8 +162,17 @@ class TransferError(MoRIIOError):
     pass
 
 
-def get_moriio_mode() -> MoRIIOMode:
-    read_mode = envs.VLLM_MORIIO_CONNECTOR_READ_MODE
+def get_moriio_mode(kv_transfer_config=None) -> MoRIIOMode:
+    # TODO(spec-decode-fix-full): #40344 changed this to read from
+    # kv_transfer_config.kv_connector_extra_config["read_mode"]. HEAD still has
+    # callers that pass nothing (env-var path); preserve both during the
+    # transition by making the arg optional and falling back to env when unset.
+    if kv_transfer_config is not None:
+        read_mode = str(
+            kv_transfer_config.kv_connector_extra_config.get("read_mode", "false")
+        ).lower().strip() in ("true", "1")
+    else:
+        read_mode = envs.VLLM_MORIIO_CONNECTOR_READ_MODE
     logger.debug("MoRIIO Connector read_mode: %s", read_mode)
     if read_mode:
         return MoRIIOMode.READ
@@ -191,6 +200,13 @@ class MoRIIOConfig:
     tp_size: int
     transfer_timeout: float
     defer_timeout: float
+    # TODO(spec-decode-fix-full): HEAD had no extra MoRIIOConfig fields here.
+    # #40344 adds these new tuning knobs; took theirs.
+    read_mode: bool = False
+    qp_per_transfer: int = 1
+    post_batch_size: int = -1
+    num_workers: int = 1
+    backend: str = "rdma"
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> "MoRIIOConfig":
@@ -201,6 +217,23 @@ class MoRIIOConfig:
         # local_kv_port     -> service port for mori engine
         # notify_port       -> For synchronizing stages between prefill and decode
         # handshake_port    -> For initial handshake between mori engine
+
+        # TODO(spec-decode-fix-full): HEAD had no docstring block here; took theirs.
+        # Optional tuning knobs
+        # read_mode        -> If true, run the connector in READ mode (consumer
+        #                     pulls KV from producer) instead of the default
+        #                     WRITE mode.
+        # transfer_timeout -> Timeout for waiting_for_transfer_complete before
+        #                     raising TransferError (sec).
+        # defer_timeout    -> Timeout before a deferred send with no finished_sending
+        #                     notification is reaped and its blocks force-freed (sec).
+
+        # Knobs for RDMA transfers, ignored if on xgmi backend
+        # qp_per_transfer  -> Number of RDMA Queue Pairs per KV transfer.
+        # post_batch_size  -> Batch size for posting transfer work requests
+        #                     (-1 lets the MoRI backend choose).
+        # num_workers      -> Number of background worker threads the MoRI
+        #                     engine uses for transfer processing.
 
         # TODO : merge notify_port and handshake_port to simplify port management
         #        supports non-contiguous ports
@@ -216,6 +249,23 @@ class MoRIIOConfig:
         tp_size = get_tensor_model_parallel_world_size()
         port_offset = get_port_offset(dp_rank, tp_rank)
 
+        transfer_timeout = float(
+            extra_config.get(
+                "transfer_timeout", MoRIIOConstants.DEFAULT_TRANSFER_TIMEOUT
+            )
+        )
+        defer_timeout = float(
+            extra_config.get("defer_timeout", MoRIIOConstants.DEFAULT_DEFER_TIMEOUT)
+        )
+        # TODO(spec-decode-fix-full): added so #40344's `backend=backend` arg
+        # in the cls(...) below resolves. Matches upstream 552eb8191 helper.
+        backend = str(extra_config.get("backend", "rdma")).lower()
+        if backend not in ("rdma", "xgmi"):
+            raise ValueError(
+                f"Invalid MoRIIO backend {backend!r} in kv_connector_extra_config; "
+                "must be one of 'rdma' or 'xgmi'."
+            )
+
         return cls(
             local_ip=get_ip(),
             local_kv_port=get_open_port(),
@@ -229,14 +279,21 @@ class MoRIIOConfig:
             dp_rank=dp_rank,
             dp_size=dp_size,
             tp_size=tp_size,
-            transfer_timeout=float(
-                extra_config.get(
-                    "transfer_timeout", MoRIIOConstants.DEFAULT_TRANSFER_TIMEOUT
-                )
-            ),
-            defer_timeout=float(
-                extra_config.get("defer_timeout", MoRIIOConstants.DEFAULT_DEFER_TIMEOUT)
-            ),
+            # TODO(spec-decode-fix-full): HEAD passed transfer_timeout/defer_timeout
+            # inline (extra_config.get). Took theirs which depends on local vars
+            # (transfer_timeout, defer_timeout) defined above and on `backend` +
+            # `get_moriio_mode(kv_transfer_config)` which do NOT yet exist in this
+            # HEAD's helper module — runtime call would NameError. Review and add
+            # `backend = str(extra_config.get("backend", "rdma")).lower()` plus
+            # update get_moriio_mode to accept kv_transfer_config (see upstream
+            # 552eb8191).
+            read_mode=get_moriio_mode(kv_transfer_config) == MoRIIOMode.READ,
+            qp_per_transfer=int(extra_config.get("qp_per_transfer", 1)),
+            post_batch_size=int(extra_config.get("post_batch_size", -1)),
+            num_workers=int(extra_config.get("num_workers", 1)),
+            backend=backend,
+            transfer_timeout=transfer_timeout,
+            defer_timeout=defer_timeout,
         )
 
 

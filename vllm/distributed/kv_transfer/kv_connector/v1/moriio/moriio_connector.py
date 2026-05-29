@@ -1393,6 +1393,11 @@ class MoRIIOConnectorWorker:
         done_sending, done_recving = set(), set()
 
         if self.is_producer:
+            # NOTE(spec-decode-fix-full): kept HEAD's READ-mode race-buffer
+            # logic (chaeminlim wedge fix) instead of theirs's simpler
+            # dict-membership filter. HEAD's _pending_unmapped_done_tids
+            # buffer subsumes #40344's filter while also handling the
+            # start_load_kv-vs-notify race.
             done_sending_raw = self.moriio_wrapper.pop_finished_req_ids()
             if self.mode == MoRIIOMode.READ:
                 # READ mode: the consumer (decode) notifies the producer
@@ -1457,6 +1462,12 @@ class MoRIIOConnectorWorker:
                 # expect a finished_recving signal for RUNNING requests.
                 self._pop_done_transfers()
 
+        # NOTE(spec-decode-fix-full): kept HEAD's explicit pop-on-match
+        # translation (chaeminlim wedge fix) which prevents
+        # transfer_id_to_request_id leak instead of theirs's dict-comprehension
+        # (which leaves entries in the map). HEAD's matched_xfer_ids set is
+        # tracked explicitly so the _unmatched_write_completions cleanup
+        # below still works after pop() removes the keys.
         # Translate consumer-side done_recving (transfer_ids reported by the
         # producer via send_notify in WRITE mode) back to the consumer's own
         # internal request_ids. Pop on success so the persistent worker map
@@ -1504,6 +1515,13 @@ class MoRIIOConnectorWorker:
             for req_id, status_list in self._recving_transfers.items():
                 last = status_list[-1]
                 if last.Succeeded():
+                    # NOTE(spec-decode-fix-full): kept HEAD's explicit
+                    # transfer_id_to_request_id.pop here (chaeminlim wedge
+                    # fix) instead of theirs's done_req_ids.add(xfer_id),
+                    # because this HEAD's _pop_done_transfers returns
+                    # set() (see docstring) and no longer maintains a
+                    # local done_req_ids accumulator. Without this pop
+                    # the persistent map grows unbounded.
                     # Use 3-tuple unpack — matches the type annotation at
                     # _recving_transfers_callback_addr and the Failed()
                     # branch below. xfer_id from the tuple replaces the
@@ -1519,7 +1537,6 @@ class MoRIIOConnectorWorker:
                     # lifetime of the engine.
                     self.transfer_id_to_request_id.pop(xfer_id, None)
 
-                    to_remove.append(req_id)
                 elif last.Failed():
                     logger.error(
                         "RDMA transfer failed for request %s: %s (code=%s). "
@@ -1945,6 +1962,11 @@ class MoRIIOConnectorWorker:
                 # tuple[str, str, str]].
                 self._recving_transfers_callback_addr[request_id] = (
                     remote_host,
+                    # NOTE(spec-decode-fix-full): kept HEAD's cross-node DP
+                    # port_offset (chaeminlim cross-node DP routing fix,
+                    # 4749051). Theirs's `remote_notify_port + self.tp_rank`
+                    # always targets remote DP rank 0 and would re-introduce
+                    # the prefill-DP-N→decode-DP-0 wedge at high concurrency.
                     str(
                         remote_notify_port
                         + get_port_offset(int(remote_dp_rank), self.tp_rank)

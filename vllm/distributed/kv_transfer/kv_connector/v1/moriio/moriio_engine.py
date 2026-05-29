@@ -9,7 +9,6 @@ import msgpack
 import torch
 import zmq
 
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.utils.network_utils import (
     make_zmq_path,
@@ -45,11 +44,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 try:
     from mori.io import (
+        BackendType,
         EngineDesc,
         IOEngine,
         MemoryDesc,
         PollCqMode,
         RdmaBackendConfig,
+        XgmiBackendConfig,
     )
 
     logger.info("MoRIIO is available")
@@ -403,9 +404,11 @@ class MoRIIOWrapper:
         self.done_remote_allocate_req_dict: dict[TransferId, RemoteAllocInfo] = {}
         self.done_write_cache_req_ids: list[str] = []
         self._transfer_timeout = transfer_timeout
-        self._qp_per_transfer = envs.VLLM_MORIIO_QP_PER_TRANSFER
-        self._post_batch_size = envs.VLLM_MORIIO_POST_BATCH_SIZE
-        self._num_worker_threads = envs.VLLM_MORIIO_NUM_WORKERS
+        # TODO(spec-decode-fix-full): HEAD initialized self._qp_per_transfer,
+        # self._post_batch_size, self._num_worker_threads from env vars here.
+        # #40344 deprecates those env vars (see _DEPRECATED_ENV_VARS in
+        # moriio_common.py) and passes the values into set_backend_type() as
+        # kwargs. Took theirs.
         self.notify_thread: threading.Thread | None = None
         self.sessions: list[IOEngine.Session] = []
         self.paths: dict[str, zmq.Socket] = {}
@@ -416,27 +419,45 @@ class MoRIIOWrapper:
         )
         self.moriio_engine = moriio_engine
 
-    def set_backend_type(self, backend_type):
+    # TODO(spec-decode-fix-full): HEAD's signature was
+    # `def set_backend_type(self, backend_type):` and pulled qp/post/workers from
+    # self._* (set in __init__ from env vars). Took theirs which passes them as
+    # kwargs from the caller (MoRIIOConnector.__init__). Caller must pass these
+    # from moriio_config.{qp_per_transfer,post_batch_size,num_workers}.
+    def set_backend_type(
+        self,
+        backend_type: "BackendType",
+        qp_per_transfer: int = 1,
+        post_batch_size: int = -1,
+        num_workers: int = 1,
+    ) -> None:
         assert self.moriio_engine is not None, "MoRIIO engine must be set first"
-        qp_per_transfer = self._qp_per_transfer
-        post_batch_size = self._post_batch_size
-        num_worker_threads = self._num_worker_threads
-        poll_mode = PollCqMode.POLLING
-        rdma_cfg = RdmaBackendConfig(
-            qp_per_transfer,
-            post_batch_size,
-            num_worker_threads,
-            poll_mode,
-            # vLLM uses ZMQ for completion signaling
-            # and never calls PopInboundTransferStatus.
-            # With notifications enabled, ibv_post_send
-            # ENOMEM at high concurrency permanently
-            # poisons TransferStatus before the data WR
-            # completes, hanging requests in
-            # WAITING_FOR_REMOTE_KVS indefinitely.
-            enable_notification=False,
-        )
-        self.moriio_engine.create_backend(backend_type, rdma_cfg)
+        if backend_type == BackendType.XGMI:
+            logger.info("Using MoRIIO backend: XGMI")
+            self.moriio_engine.create_backend(backend_type, XgmiBackendConfig())
+        else:
+            logger.info(
+                "Using MoRIIO backend: RDMA "
+                "(qp_per_transfer=%d, post_batch_size=%d, num_workers=%d)",
+                qp_per_transfer,
+                post_batch_size,
+                num_workers,
+            )
+            rdma_cfg = RdmaBackendConfig(
+                qp_per_transfer,
+                post_batch_size,
+                num_workers,
+                PollCqMode.POLLING,
+                # vLLM uses ZMQ for completion signaling
+                # and never calls PopInboundTransferStatus.
+                # With notifications enabled, ibv_post_send
+                # ENOMEM at high concurrency permanently
+                # poisons TransferStatus before the data WR
+                # completes, hanging requests in
+                # WAITING_FOR_REMOTE_KVS indefinitely.
+                enable_notification=False,
+            )
+            self.moriio_engine.create_backend(backend_type, rdma_cfg)
 
     def get_agent_metadata(self):
         assert self.moriio_engine is not None, "MoRIIO engine must be set first"
