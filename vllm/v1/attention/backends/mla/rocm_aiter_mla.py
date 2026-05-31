@@ -139,8 +139,13 @@ _FP8_PREFILL_TILE_Q = 256
 class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
     # TODO(luka, lucas): audit this as part of:
     #  https://github.com/vllm-project/vllm/issues/22945
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
-    query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
+    # The ROCm AITER MLA decode kernel is reliable for qlen=1, but MTP
+    # verification presents qlen=2 and can corrupt TP8 logits through
+    # mla_decode_fwd. Classify qlen>1 as prefill/piecewise instead of decode.
+    query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.SINGLE_ONLY
 
     def __init__(
         self,
@@ -904,6 +909,11 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             dtype=attn_metadata.decode.attn_out_dtype,
             device=q.device,
         )
+        if attn_metadata.decode.max_qo_len > 1:
+            # MTP verification can call the AITER MLA decode kernel with
+            # qlen > 1.  Keep the historical zero-filled output behavior for
+            # that path so any unwritten kernel lanes cannot leak into logits.
+            o.zero_()
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 

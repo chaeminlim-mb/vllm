@@ -91,6 +91,10 @@ def is_moriio_available() -> bool:
 
 
 class MoRIIOConnector(KVConnectorBase_V1):
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        return True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -198,7 +202,8 @@ class MoRIIOConnector(KVConnectorBase_V1):
         self.connector_worker.start_load_kv(self._connector_metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        pass
+        assert self.connector_worker is not None
+        self.connector_worker.wait_for_layer_load(layer_name)
 
     def save_kv_layer(
         self,
@@ -847,8 +852,8 @@ class MoRIIOConnectorWorker:
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
         self.dst_num_blocks: dict[EngineId, int] = {}
-        # In progress transfers.
-        self._recving_transfers: defaultdict[ReqId, list] = defaultdict(list)
+        # In progress READ-mode transfers: req_id -> layer_name -> transfer status.
+        self._recving_transfers: defaultdict[ReqId, dict[str, Any]] = defaultdict(dict)
         # Values are (remote_host, remote_notify_port, transfer_id).
         self._recving_transfers_callback_addr: dict[ReqId, tuple[str, str, str]] = {}
 
@@ -1481,6 +1486,46 @@ class MoRIIOConnectorWorker:
 
         return done_sending, done_recving
 
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if self.is_producer or self.mode != MoRIIOMode.READ:
+            return
+
+        deadline = time.monotonic() + self.moriio_config.transfer_timeout
+        while True:
+            with self.moriio_wrapper.lock:
+                pending = [
+                    (req_id, status_by_layer[layer_name])
+                    for req_id, status_by_layer in self._recving_transfers.items()
+                    if layer_name in status_by_layer
+                ]
+
+            if not pending:
+                return
+
+            still_running = False
+            for req_id, status in pending:
+                if status.Succeeded():
+                    continue
+                if status.Failed():
+                    raise RuntimeError(
+                        "MoRIIO READ transfer failed for "
+                        f"request {req_id}, layer {layer_name}: "
+                        f"{status.Message()} (code={status.Code()})"
+                    )
+                still_running = True
+
+            if not still_running:
+                return
+
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    "Timed out waiting for MoRIIO READ transfer for "
+                    f"layer {layer_name}; adjust with "
+                    "kv_connector_extra_config.transfer_timeout"
+                )
+
+            time.sleep(0.001)
+
     def _pop_done_transfers(self) -> set[str]:
         """Pop completed remote-read transfers and notify the producer.
 
@@ -1501,9 +1546,12 @@ class MoRIIOConnectorWorker:
         # inverse lookup is required here.
         with self.moriio_wrapper.lock:
             to_remove = []
-            for req_id, status_list in self._recving_transfers.items():
-                last = status_list[-1]
-                if last.Succeeded():
+            for req_id, status_by_layer in self._recving_transfers.items():
+                statuses = list(status_by_layer.values())
+                failed_status = next(
+                    (status for status in statuses if status.Failed()), None
+                )
+                if statuses and all(status.Succeeded() for status in statuses):
                     # Use 3-tuple unpack — matches the type annotation at
                     # _recving_transfers_callback_addr and the Failed()
                     # branch below. xfer_id from the tuple replaces the
@@ -1520,14 +1568,14 @@ class MoRIIOConnectorWorker:
                     self.transfer_id_to_request_id.pop(xfer_id, None)
 
                     to_remove.append(req_id)
-                elif last.Failed():
+                elif failed_status is not None:
                     logger.error(
                         "RDMA transfer failed for request %s: %s (code=%s). "
                         "Notifying prefill to free blocks; request will be "
                         "aborted by timeout.",
                         req_id,
-                        last.Message(),
-                        last.Code(),
+                        failed_status.Message(),
+                        failed_status.Code(),
                     )
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     try:
@@ -1928,7 +1976,7 @@ class MoRIIOConnectorWorker:
                 offs[2], offs[0], offs[1], sessions[sess_idx]
             )
             with self.moriio_wrapper.lock:
-                self._recving_transfers[request_id].append(transfer_status)
+                self._recving_transfers[request_id][layer_name] = transfer_status
                 # Notify-back must target the SPECIFIC prefill DP rank that
                 # owns the KV (== remote_dp_rank), not always rank 0. Each
                 # rank's notify listener binds to base_port + port_offset.

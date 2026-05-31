@@ -187,7 +187,9 @@ def _reshape_kv_cache(
 
                 if kv_cache_group_id < len(kernel_block_sizes):
                     kernel_block_size = kernel_block_sizes[kv_cache_group_id]
-                    num_blocks *= kv_cache_spec.block_size // kernel_block_size
+                    num_blocks *= (
+                        kv_cache_spec.storage_block_size // kernel_block_size
+                    )
                 else:
                     kernel_block_size = kv_cache_spec.block_size
 
