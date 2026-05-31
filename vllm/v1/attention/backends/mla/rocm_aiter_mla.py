@@ -147,6 +147,35 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
     # mla_decode_fwd. Classify qlen>1 as prefill/piecewise instead of decode.
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.SINGLE_ONLY
 
+    @classmethod
+    def _allow_uniform_mtp_decode(cls, vllm_config: VllmConfig) -> bool:
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is None:
+            return False
+
+        num_spec_tokens = getattr(
+            speculative_config,
+            "num_speculative_tokens",
+            getattr(speculative_config, "num_spec_tokens", None),
+        )
+        method = getattr(speculative_config, "method", None)
+
+        return (
+            vllm_config.parallel_config.tensor_parallel_size == 1
+            and method in ("mtp", "deepseek_mtp")
+            and num_spec_tokens == 1
+        )
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        if cls._allow_uniform_mtp_decode(vllm_config):
+            return AttentionCGSupport.UNIFORM_BATCH
+        return super().get_cudagraph_support(vllm_config, kv_cache_spec)
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -154,6 +183,9 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        if self._allow_uniform_mtp_decode(vllm_config):
+            self.query_len_support = QueryLenSupport.UNIFORM
+
         super().__init__(
             kv_cache_spec, layer_names, vllm_config, device, AiterMLAMetadata
         )
@@ -484,9 +516,12 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
         else:
-            qo_indptr = torch.arange(
-                0, num_reqs + 1, step=1, dtype=torch.int32, device=device
-            )
+            if max_qo_len == 1:
+                qo_indptr = torch.arange(
+                    0, num_reqs + 1, step=1, dtype=torch.int32, device=device
+                )
+            else:
+                qo_indptr = query_start_loc_device[: 1 + num_reqs]
 
         # The aiter MLA ASM kernel only supports qseqlen=1 (single-token
         # decode). With speculative decoding, the verification step has
