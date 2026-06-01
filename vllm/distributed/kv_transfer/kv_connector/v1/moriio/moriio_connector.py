@@ -90,10 +90,19 @@ def is_moriio_available() -> bool:
     return MoRIIO_enabled
 
 
+def _get_bool_extra_config(extra_config: dict[str, Any], key: str) -> bool:
+    value = extra_config.get(key, False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 class MoRIIOConnector(KVConnectorBase_V1):
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
-        return True
+        return not _get_bool_extra_config(extra_config, "allow_full_cudagraph")
 
     def __init__(
         self,
@@ -426,13 +435,15 @@ class MoRIIOConnectorScheduler:
                         # a full prefix cache hit on the D worker. We need to call
                         # send_notify in _read_blocks to free the memory on the P.
 
-                        # Get unhashed blocks to pull from remote.
+                        # Get local blocks to pull remote KV into. If the
+                        # producer returned a longer remote list, trim the
+                        # remote suffix to match the local allocation. Do not
+                        # replace local ids: they index the decode KV cache.
                         local_block_ids = blocks.get_block_ids()[0]
                         assert len(local_block_ids) <= len(remote_block_ids)
-                        if len(local_block_ids) == len(remote_block_ids):
-                            pass
-                        else:
-                            local_block_ids = remote_block_ids[-len(local_block_ids) :]
+                        if len(local_block_ids) != len(remote_block_ids):
+                            remote_block_ids = remote_block_ids[-len(local_block_ids) :]
+                            params["remote_block_ids"] = remote_block_ids
 
                         self._reqs_need_recv[request.request_id] = (
                             request,
@@ -752,6 +763,15 @@ class MoRIIOConnectorWorker:
         self.handshake_port = self.moriio_config.handshake_port
         self.notify_port = self.moriio_config.notify_port
 
+        node_hosts_env = os.environ.get("VLLM_MORIIO_NODE_HOSTS", "").strip()
+        if node_hosts_env:
+            self.node_hosts: list[str] = [
+                host.strip() for host in node_hosts_env.split(",") if host.strip()
+            ]
+        else:
+            self.node_hosts = [self.local_ip]
+        self.dp_rank_to_host: dict[int, str] = {}
+
         self.zmq_context = zmq.Context()
         self.metadata_address = (
             f"{self.moriio_config.local_ip}:{self.moriio_config.local_ping_port}"
@@ -1005,6 +1025,7 @@ class MoRIIOConnectorWorker:
                         # READ (prefill-then-decode, sequential) from WRITE (concurrent)
                         # scheduling.
                         "transfer_mode": self.mode.name,
+                        "node_hosts": list(self.node_hosts),
                     }
 
                     sock.send(msgpack.dumps(data))
@@ -1151,6 +1172,7 @@ class MoRIIOConnectorWorker:
             remote_agent_name = self.moriio_wrapper.register_remote_engine(
                 metadata.agent_metadata
             )
+            self.dp_rank_to_host[int(remote_dp_rank)] = host
 
             logger.debug(
                 "MoRIIO handshake: registered"
@@ -1210,6 +1232,17 @@ class MoRIIOConnectorWorker:
                 return meta.remote_hosts[node_idx]
         return meta.remote_host
 
+    def _pick_host_for_dp_rank(self, meta: ReqMeta, dp_rank: int) -> str:
+        if meta.remote_hosts and len(meta.remote_hosts) > 1:
+            n_hosts = len(meta.remote_hosts)
+            if int(meta.remote_dp_size) >= n_hosts:
+                dp_per_node = max(1, int(meta.remote_dp_size) // n_hosts)
+                node_idx = dp_rank // dp_per_node
+                if 0 <= node_idx < n_hosts:
+                    return meta.remote_hosts[node_idx]
+            return self._pick_remote_host(meta)
+        return meta.remote_host
+
     def _background_moriio_handshake(
         self, req_id: ReqId, remote_engine_id: EngineId, meta: ReqMeta
     ):
@@ -1218,9 +1251,6 @@ class MoRIIOConnectorWorker:
         if remote_engine_id is not None:
             fut = self._handshake_futures.get(remote_engine_id)
         if fut is None:
-            # Multi-node TP: pick the producer host for this worker's tp_rank.
-            # For single-node TP this returns meta.remote_host unchanged.
-            host = self._pick_remote_host(meta)
             port = int(meta.remote_handshake_port)
             tp_size = int(meta.tp_size)
             remote_dp_size = int(meta.remote_dp_size)
@@ -1237,6 +1267,7 @@ class MoRIIOConnectorWorker:
 
         for cur_dp_rank in range(remote_dp_size):
             dp_engine_id = self.get_engine_name_with_dp(remote_engine_id, cur_dp_rank)
+            host = self._pick_host_for_dp_rank(meta, cur_dp_rank)
             future = self._handshake_initiation_executor.submit(
                 self._moriio_handshake, host, port, tp_size, dp_engine_id, cur_dp_rank
             )
@@ -1616,11 +1647,13 @@ class MoRIIOConnectorWorker:
 
             meta.remote_engine_id = remote_engine_id
 
-            dp0_remote_engine_id = self.get_engine_name_with_dp(remote_engine_id, 0)
-            if dp0_remote_engine_id not in self._remote_agents:
+            target_remote_engine_id = self.get_engine_name_with_dp(
+                remote_engine_id, int(meta.remote_dp_rank)
+            )
+            if target_remote_engine_id not in self._remote_agents:
                 # Initiate handshake with remote engine to exchange metadata.
                 with self._handshake_lock:
-                    if remote_engine_id not in self._remote_agents:
+                    if target_remote_engine_id not in self._remote_agents:
                         self._background_moriio_handshake(
                             req_id, remote_engine_id, meta
                         )
@@ -1723,7 +1756,8 @@ class MoRIIOConnectorWorker:
                 not self._ready_requests.empty()
                 and remote_engine_id in self.load_ready_flag
             ):
-                self._read_blocks_for_req(*self._ready_requests.get_nowait())
+                while not self._ready_requests.empty():
+                    self._read_blocks_for_req(*self._ready_requests.get_nowait())
                 break
             else:
                 break
@@ -1736,13 +1770,9 @@ class MoRIIOConnectorWorker:
             meta.remote_engine_id,
             req_id,
         )
-        # Multi-node TP: remote_host here is used by _read_blocks to record the
-        # post-transfer notify callback address (so prefill can free its KV
-        # blocks). For multi-node prefill the notify must go to the prefill
-        # node that actually owns this worker's KV slice, not the prefill
-        # head. _pick_remote_host returns meta.remote_host unchanged for
-        # single-host setups, preserving TP=8 / monolithic behaviour.
-        actual_remote_host = self._pick_remote_host(meta)
+        actual_remote_host = self._pick_host_for_dp_rank(
+            meta, int(meta.remote_dp_rank)
+        )
         self._read_blocks(
             request_id=req_id,
             transfer_id=meta.transfer_id,
@@ -1752,6 +1782,7 @@ class MoRIIOConnectorWorker:
             remote_host=actual_remote_host,
             remote_notify_port=meta.remote_notify_port,
             remote_dp_rank=meta.remote_dp_rank,
+            remote_tp_size=int(meta.tp_size),
         )
 
     def _write_blocks_for_req(self, req_id: ReqId, meta: ReqMeta, layer_name, kv_layer):
@@ -1908,6 +1939,7 @@ class MoRIIOConnectorWorker:
         remote_host: str,
         remote_notify_port: int,
         remote_dp_rank: int = 0,
+        remote_tp_size: int = 1,
     ) -> None:
         if self.mode == MoRIIOMode.WRITE:
             return
@@ -1995,7 +2027,9 @@ class MoRIIOConnectorWorker:
                     remote_host,
                     str(
                         remote_notify_port
-                        + get_port_offset(int(remote_dp_rank), self.tp_rank)
+                        + get_port_offset(
+                            int(remote_dp_rank), self.tp_rank, int(remote_tp_size)
+                        )
                     ),
                     transfer_id,
                 )

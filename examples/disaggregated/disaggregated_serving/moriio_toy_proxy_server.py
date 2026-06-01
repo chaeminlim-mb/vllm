@@ -76,6 +76,7 @@ def _listen_for_register(hostname, port):
                     "dp_size": data["dp_size"],
                     "tp_size": data["tp_size"],
                     "transfer_mode": data["transfer_mode"],
+                    "node_hosts": data.get("node_hosts", []),
                 }
                 # zmq_address format: "host:IP,handshake:PORT,notify:PORT"
                 # Stored verbatim; embedded into the request_id by handle_request.
@@ -182,7 +183,7 @@ async def send_request_to_prefill(
                 raise RuntimeError(error_message)
 
 
-async def start_decode_request(endpoint, req_data, request_id):
+async def start_decode_request(endpoint, req_data, request_id, data_parallel_rank=None):
     session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=6 * 6000 * 6000)
     )
@@ -190,6 +191,8 @@ async def start_decode_request(endpoint, req_data, request_id):
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
     }
+    if data_parallel_rank is not None:
+        headers["X-data-parallel-rank"] = str(data_parallel_rank)
     response = await session.post(url=endpoint, json=req_data, headers=headers)
     return session, response
 
@@ -212,7 +215,7 @@ async def stream_decode_response(session, response, request_id):
 
 
 def example_round_robin_dp_loader(request_number, dp_size):
-    return request_nums % dp_size
+    return (request_number - 1) % dp_size
 
 
 @app.route("/health", methods=["GET"])
@@ -238,6 +241,7 @@ async def handle_request(api: str, request: Request):
         with _list_lock:
             global request_nums
             request_nums += 1
+            request_number = request_nums
 
         req_data = await request.get_json()
 
@@ -253,15 +257,15 @@ async def handle_request(api: str, request: Request):
                     503,
                 )
             )
-        pid = request_nums % len(prefill_instances)
-        did = request_nums % len(decode_instances)
+        pid = (request_number - 1) % len(prefill_instances)
+        did = (request_number - 1) % len(decode_instances)
         prefill_instance_endpoint = prefill_instances[pid]
         decode_instance_endpoint = decode_instances[did]
 
         selected_prefill_dp_rank = None
         if prefill_instance_endpoint["dp_size"] > 1:
             selected_prefill_dp_rank = example_round_robin_dp_loader(
-                request_nums // len(prefill_instance_endpoint),
+                request_number,
                 prefill_instance_endpoint["dp_size"],
             )
 
@@ -286,6 +290,15 @@ async def handle_request(api: str, request: Request):
             decode_instance_endpoint["tp_size"]
         )
         req_data_to_prefill["kv_transfer_params"]["transfer_id"] = transfer_id
+        decode_hosts = decode_instance_endpoint.get("node_hosts") or []
+        if decode_hosts:
+            req_data_to_prefill["kv_transfer_params"]["remote_hosts"] = list(
+                decode_hosts
+            )
+        if selected_prefill_dp_rank is not None:
+            req_data_to_prefill["kv_transfer_params"]["remote_dp_rank"] = (
+                selected_prefill_dp_rank
+            )
 
         prefill_request_url = prefill_instance_endpoint["request_address"] + api
         send_prefill_task = asyncio.create_task(
@@ -327,6 +340,9 @@ async def handle_request(api: str, request: Request):
             req_data["kv_transfer_params"]["remote_hosts"] = prefill_kv.get(
                 "remote_hosts"
             )
+        prefill_hosts = prefill_instance_endpoint.get("node_hosts") or []
+        if prefill_hosts:
+            req_data["kv_transfer_params"]["remote_hosts"] = list(prefill_hosts)
 
         req_data["kv_transfer_params"]["remote_dp_size"] = prefill_instance_endpoint[
             "dp_size"
@@ -341,7 +357,12 @@ async def handle_request(api: str, request: Request):
 
         decode_request_url = decode_instance_endpoint["request_address"] + api
         decode_request_task = asyncio.create_task(
-            start_decode_request(decode_request_url, req_data, request_id)
+            start_decode_request(
+                decode_request_url,
+                req_data,
+                request_id,
+                selected_prefill_dp_rank,
+            )
         )
 
         session, decode_response = await decode_request_task

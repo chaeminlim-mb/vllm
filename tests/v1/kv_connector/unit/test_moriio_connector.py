@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import importlib.util
 import os
+import queue
 import subprocess
 import uuid
 from unittest.mock import MagicMock, patch
@@ -25,6 +26,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOAgentMetadata,
     MoRIIOConnectorMetadata,
     MoRIIOConstants,
+    MoRIIOMode,
+    ReqMeta,
     zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
@@ -420,6 +423,109 @@ def test_read_mode_loads_remote_block_ids(moriio_read_mode):
         ],
     ):
         assert block_id == block.block_id, f"{block_id} != {block.block_id}"
+
+
+def test_read_mode_trims_remote_blocks_not_local_blocks(moriio_read_mode):
+    """Read mode trims remote suffix without replacing local block ids."""
+
+    vllm_config = create_vllm_config(role="kv_consumer")
+    scheduler = create_scheduler(vllm_config)
+
+    block_size = vllm_config.cache_config.block_size
+    request = create_request(
+        request_id=1,
+        block_size=block_size,
+        num_tokens=int(block_size * 2.5),
+        do_remote_decode=False,
+        do_remote_prefill=True,
+    )
+    request = _setup_kv_transfer_request(request)
+    request_id = request.request_id
+
+    scheduler.add_request(request)
+    local_blocks = scheduler.kv_cache_manager.coordinator.single_type_managers[
+        0
+    ].req_to_blocks[request_id]
+    local_block_ids = [block.block_id for block in local_blocks]
+
+    remote_block_ids = [1000, 1001] + list(range(2000, 2000 + len(local_blocks)))
+    request.kv_transfer_params["remote_block_ids"] = remote_block_ids
+
+    scheduler_output = scheduler.schedule()
+    kv_connector_metadata = scheduler_output.kv_connector_metadata
+    assert kv_connector_metadata is not None
+    req_meta = kv_connector_metadata.reqs_to_recv[request_id]
+
+    assert req_meta.local_block_ids == local_block_ids
+    assert req_meta.remote_block_ids == remote_block_ids[-len(local_blocks) :]
+
+
+def test_requires_piecewise_for_cudagraph_by_default():
+    assert MoRIIOConnector.requires_piecewise_for_cudagraph({}) is True
+    assert (
+        MoRIIOConnector.requires_piecewise_for_cudagraph(
+            {"allow_full_cudagraph": False}
+        )
+        is True
+    )
+    assert (
+        MoRIIOConnector.requires_piecewise_for_cudagraph({"allow_full_cudagraph": "0"})
+        is True
+    )
+
+
+def test_requires_piecewise_for_cudagraph_can_be_disabled():
+    assert (
+        MoRIIOConnector.requires_piecewise_for_cudagraph(
+            {"allow_full_cudagraph": True}
+        )
+        is False
+    )
+    assert (
+        MoRIIOConnector.requires_piecewise_for_cudagraph(
+            {"allow_full_cudagraph": "true"}
+        )
+        is False
+    )
+
+
+def test_read_mode_start_load_kv_drains_all_ready_requests():
+    worker = object.__new__(MoRIIOConnectorWorker)
+    worker.transfer_id_to_request_id = {}
+    worker.is_producer = False
+    worker.mode = MoRIIOMode.READ
+    worker._reqs_to_send = {}
+    worker._ready_requests = queue.Queue()
+    worker.load_ready_flag = {"127.0.0.1:4789": True}
+    worker._remote_agents = {"127.0.0.1:4789_dp0": {"agent"}}
+    worker.moriio_config = MagicMock(transfer_timeout=0.01)
+
+    def make_meta(transfer_id):
+        return ReqMeta(
+            transfer_id=transfer_id,
+            local_block_ids=[1],
+            remote_block_ids=[2],
+            remote_host="127.0.0.1",
+            remote_port=4789,
+            remote_handshake_port=4789,
+            remote_notify_port=4789,
+            remote_engine_id="127.0.0.1:4789",
+            tp_size=1,
+            remote_dp_size=1,
+        )
+
+    metadata = MoRIIOConnectorMetadata()
+    metadata.reqs_to_recv["direct"] = make_meta("transfer-direct")
+    worker._ready_requests.put(("ready-1", make_meta("transfer-ready-1")))
+    worker._ready_requests.put(("ready-2", make_meta("transfer-ready-2")))
+
+    read_calls = []
+    worker._read_blocks_for_req = lambda req_id, meta: read_calls.append(req_id)
+
+    worker.start_load_kv(metadata)
+
+    assert read_calls == ["direct", "ready-1", "ready-2"]
+    assert worker._ready_requests.empty()
 
 
 @pytest.mark.skipif(
