@@ -10,6 +10,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOMode,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
+    MoRIIOConnector,
     MoRIIOConnectorWorker,
 )
 
@@ -65,6 +66,20 @@ def make_worker() -> MoRIIOConnectorWorker:
     worker._recving_transfers_callback_addr = {}
     worker.transfer_id_to_request_id = {}
     return worker
+
+
+def test_finished_count_tracks_tensor_parallel_size() -> None:
+    connector = object.__new__(MoRIIOConnector)
+    connector._vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, data_parallel_size=8)
+    )
+
+    assert connector.get_finished_count() == 1
+
+    connector._vllm_config.parallel_config.tensor_parallel_size = 8
+    connector._vllm_config.parallel_config.data_parallel_size = 1
+
+    assert connector.get_finished_count() == 8
 
 
 def test_wait_for_layer_load_waits_until_layer_status_succeeds() -> None:

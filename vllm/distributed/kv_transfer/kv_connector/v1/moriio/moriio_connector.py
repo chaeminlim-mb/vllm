@@ -257,6 +257,10 @@ class MoRIIOConnector(KVConnectorBase_V1):
         except AttributeError:
             return False
 
+    def get_finished_count(self) -> int | None:
+        # A request's KV transfer spans its TP group, not every DP/EP worker.
+        return self._vllm_config.parallel_config.tensor_parallel_size
+
 
 class MoRIIOConnectorScheduler:
     """Implementation of Scheduler side methods"""
