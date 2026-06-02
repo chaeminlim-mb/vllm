@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import queue
 import threading
 from collections import defaultdict
 from types import SimpleNamespace
@@ -7,7 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
+    MoRIIOConfig,
     MoRIIOMode,
+    ReqMeta,
+    get_moriio_mode,
+    get_port_offset,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
     MoRIIOConnector,
@@ -48,22 +53,52 @@ class FakeWrapper:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.notifies: list[tuple[str, str, str]] = []
+        self.read_error: Exception | None = None
+        self.read_results: list[FakeStatus | Exception] = []
+        self.notify_error: Exception | None = None
 
     def send_notify(self, transfer_id: str, host: str, port: str) -> None:
+        if self.notify_error is not None:
+            error = self.notify_error
+            self.notify_error = None
+            raise error
         self.notifies.append((transfer_id, host, port))
+
+    def read_remote_data(self, *_args):
+        if self.read_results:
+            result = self.read_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+        if self.read_error is not None:
+            raise self.read_error
+        return FakeStatus()
 
     def shutdown(self) -> None:
         pass
+
+
+class FakeTensor:
+    def numel(self) -> int:
+        return 1
+
+    def element_size(self) -> int:
+        return 1
 
 
 def make_worker() -> MoRIIOConnectorWorker:
     worker = object.__new__(MoRIIOConnectorWorker)
     worker.is_producer = False
     worker.mode = MoRIIOMode.READ
-    worker.moriio_config = SimpleNamespace(transfer_timeout=1.0)
+    worker.moriio_config = SimpleNamespace(transfer_timeout=1.0, defer_timeout=1.0)
     worker.moriio_wrapper = FakeWrapper()
     worker._recving_transfers = defaultdict(dict)
     worker._recving_transfers_callback_addr = {}
+    worker._recving_transfer_local_block_ids = {}
+    worker._invalid_block_ids = queue.Queue()
+    worker._reqs_to_send = {}
+    worker._pending_unmapped_done_tids = set()
+    worker._unmatched_write_completions = set()
     worker.transfer_id_to_request_id = {}
     return worker
 
@@ -80,6 +115,113 @@ def test_finished_count_tracks_tensor_parallel_size() -> None:
     connector._vllm_config.parallel_config.data_parallel_size = 1
 
     assert connector.get_finished_count() == 8
+
+
+def test_get_port_offset_includes_tensor_parallel_size() -> None:
+    assert get_port_offset(dp_rank=0, tp_rank=7, tp_size=16) == 7
+    assert get_port_offset(dp_rank=1, tp_rank=0, tp_size=16) == 16
+    assert get_port_offset(dp_rank=3, tp_rank=5, tp_size=16) == 53
+
+
+def test_moriio_config_notify_port_uses_tensor_parallel_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common as common
+
+    monkeypatch.setattr(common, "get_tensor_model_parallel_rank", lambda: 3)
+    monkeypatch.setattr(common, "get_tensor_model_parallel_world_size", lambda: 16)
+    monkeypatch.setattr(common, "get_ip", lambda: "127.0.0.1")
+    monkeypatch.setattr(common, "get_open_port", lambda: 12345)
+
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={
+                "notify_port": 61005,
+                "proxy_ip": "127.0.0.1",
+                "proxy_ping_port": 36367,
+                "http_port": 8100,
+                "handshake_port": 6301,
+            }
+        ),
+        parallel_config=SimpleNamespace(
+            data_parallel_rank=2,
+            data_parallel_size=4,
+        ),
+    )
+
+    config = MoRIIOConfig.from_vllm_config(vllm_config)
+
+    assert config.notify_port == 61005 + 35
+    assert config.tp_size == 16
+    assert config.tp_rank == 3
+    assert config.dp_rank == 2
+
+
+def test_read_mode_extra_config_overrides_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_MORIIO_CONNECTOR_READ_MODE", "False")
+    assert get_moriio_mode({"read_mode": True}) == MoRIIOMode.READ
+    assert get_moriio_mode({"read_mode": "true"}) == MoRIIOMode.READ
+
+    monkeypatch.setenv("VLLM_MORIIO_CONNECTOR_READ_MODE", "True")
+    assert get_moriio_mode({"read_mode": False}) == MoRIIOMode.WRITE
+    assert get_moriio_mode({"read_mode": "False"}) == MoRIIOMode.WRITE
+    assert get_moriio_mode({"read_mode": "0"}) == MoRIIOMode.WRITE
+    assert get_moriio_mode({"read_mode": "off"}) == MoRIIOMode.WRITE
+    assert get_moriio_mode({"read_mode": None}) == MoRIIOMode.WRITE
+    assert get_moriio_mode({}) == MoRIIOMode.READ
+
+
+def make_req_meta(
+    *,
+    tp_size: int,
+    remote_dp_size: int,
+    remote_hosts: list[str] | None = None,
+) -> ReqMeta:
+    remote_hosts = remote_hosts or ["host0", "host1"]
+    return ReqMeta(
+        transfer_id="transfer0",
+        local_block_ids=[1],
+        remote_block_ids=[2],
+        remote_host="host0",
+        remote_port=1234,
+        remote_handshake_port=6301,
+        remote_notify_port=61005,
+        remote_engine_id="host0:6301",
+        tp_size=tp_size,
+        remote_dp_size=remote_dp_size,
+        remote_hosts=remote_hosts,
+    )
+
+
+def test_multi_node_tp_host_selection_prefers_tp_rank() -> None:
+    worker = object.__new__(MoRIIOConnectorWorker)
+    worker.tp_rank = 9
+
+    meta = make_req_meta(tp_size=16, remote_dp_size=1)
+
+    assert worker._pick_host_for_dp_rank(meta, dp_rank=7) == "host1"
+
+
+def test_multi_node_dp_host_selection_uses_dp_rank_when_dp_size_gt_one() -> None:
+    worker = object.__new__(MoRIIOConnectorWorker)
+    worker.tp_rank = 0
+
+    meta = make_req_meta(
+        tp_size=8,
+        remote_dp_size=8,
+        remote_hosts=[f"host{i}" for i in range(8)],
+    )
+
+    assert worker._pick_host_for_dp_rank(meta, dp_rank=7) == "host7"
+
+
+def test_multi_node_dp_host_selection_uses_dp_rank_for_tp1() -> None:
+    worker = object.__new__(MoRIIOConnectorWorker)
+    worker.tp_rank = 0
+
+    meta = make_req_meta(tp_size=1, remote_dp_size=16)
+
+    assert worker._pick_host_for_dp_rank(meta, dp_rank=12) == "host1"
 
 
 def test_wait_for_layer_load_waits_until_layer_status_succeeds() -> None:
@@ -100,11 +242,30 @@ def test_wait_for_layer_load_raises_on_failed_status() -> None:
         worker.wait_for_layer_load("layer0")
 
 
+def test_wait_for_layer_load_failure_marks_local_blocks_invalid() -> None:
+    worker = make_worker()
+    worker._recving_transfers["req0"]["layer0"] = FakeStatus(failed=True)
+    worker._recving_transfers_callback_addr["req0"] = ("host", "1234", "transfer0")
+    worker._recving_transfer_local_block_ids["req0"] = {11, 12}
+    worker.transfer_id_to_request_id["transfer0"] = "req0"
+
+    with pytest.raises(RuntimeError, match="request req0, layer layer0"):
+        worker.wait_for_layer_load("layer0")
+
+    assert worker.moriio_wrapper.notifies == [("transfer0", "host", "1234")]
+    assert worker.get_block_ids_with_load_errors() == {11, 12}
+    assert "req0" not in worker._recving_transfers
+    assert "req0" not in worker._recving_transfers_callback_addr
+    assert "req0" not in worker._recving_transfer_local_block_ids
+    assert "transfer0" not in worker.transfer_id_to_request_id
+
+
 def test_pop_done_transfers_waits_for_all_layer_statuses() -> None:
     worker = make_worker()
     worker._recving_transfers["req0"]["layer0"] = FakeStatus(succeeded=True)
     worker._recving_transfers["req0"]["layer1"] = FakeStatus()
     worker._recving_transfers_callback_addr["req0"] = ("host", "1234", "transfer0")
+    worker._recving_transfer_local_block_ids["req0"] = {11, 12}
     worker.transfer_id_to_request_id["transfer0"] = "req0"
 
     assert worker._pop_done_transfers() == set()
@@ -117,4 +278,113 @@ def test_pop_done_transfers_waits_for_all_layer_statuses() -> None:
     assert worker.moriio_wrapper.notifies == [("transfer0", "host", "1234")]
     assert "req0" not in worker._recving_transfers
     assert "req0" not in worker._recving_transfers_callback_addr
+    assert "req0" not in worker._recving_transfer_local_block_ids
     assert "transfer0" not in worker.transfer_id_to_request_id
+
+
+def test_pop_done_transfers_retries_success_notify_failure() -> None:
+    worker = make_worker()
+    worker._recving_transfers["req0"]["layer0"] = FakeStatus(succeeded=True)
+    worker._recving_transfers_callback_addr["req0"] = ("host", "1234", "transfer0")
+    worker._recving_transfer_local_block_ids["req0"] = {11, 12}
+    worker.transfer_id_to_request_id["transfer0"] = "req0"
+    worker.moriio_wrapper.notify_error = RuntimeError("notify failed")
+
+    assert worker._pop_done_transfers() == set()
+
+    assert worker.moriio_wrapper.notifies == []
+    assert "req0" in worker._recving_transfers
+    assert worker.transfer_id_to_request_id["transfer0"] == "req0"
+
+    assert worker._pop_done_transfers() == set()
+
+    assert worker.moriio_wrapper.notifies == [("transfer0", "host", "1234")]
+    assert "req0" not in worker._recving_transfers
+    assert "transfer0" not in worker.transfer_id_to_request_id
+
+
+def test_failed_read_marks_local_blocks_invalid() -> None:
+    worker = make_worker()
+    worker._recving_transfers["req0"]["layer0"] = FakeStatus(failed=True)
+    worker._recving_transfers_callback_addr["req0"] = ("host", "1234", "transfer0")
+    worker._recving_transfer_local_block_ids["req0"] = {11, 12}
+    worker.transfer_id_to_request_id["transfer0"] = "req0"
+
+    assert worker._pop_done_transfers() == set()
+
+    assert worker.moriio_wrapper.notifies == [("transfer0", "host", "1234")]
+    assert worker.get_block_ids_with_load_errors() == {11, 12}
+    assert worker.get_block_ids_with_load_errors() == set()
+    assert "req0" not in worker._recving_transfers
+    assert "req0" not in worker._recving_transfers_callback_addr
+    assert "req0" not in worker._recving_transfer_local_block_ids
+    assert "transfer0" not in worker.transfer_id_to_request_id
+
+
+def test_read_blocks_partial_setup_exception_marks_local_blocks_invalid() -> None:
+    worker = make_worker()
+    worker.tp_rank = 2
+    worker.dp_rank = 0
+    worker.kv_caches = {"layer0": FakeTensor(), "layer1": FakeTensor()}
+    worker.layer_name_to_local_kv_cache_metadata = {"layer0": [], "layer1": []}
+    worker._get_built_session = lambda _engine_id: (
+        ["session0", "session1"],
+        SimpleNamespace(num_blocks=1, block_len=1),
+    )
+    worker._compute_block_transfer_offsets = lambda *_args: ([0], [0], [1])
+    worker.moriio_wrapper.read_results = [
+        FakeStatus(succeeded=True),
+        RuntimeError("layer1 setup failed"),
+    ]
+
+    with pytest.raises(RuntimeError, match="layer1 setup failed"):
+        worker._read_blocks(
+            local_block_ids=[11, 12],
+            remote_block_ids=[21, 22],
+            dst_engine_id="remote",
+            request_id="req0",
+            transfer_id="transfer0",
+            remote_host="host",
+            remote_notify_port=61005,
+            remote_dp_rank=1,
+            remote_tp_size=16,
+        )
+
+    assert worker.moriio_wrapper.notifies == [("transfer0", "host", "61023")]
+    assert worker.get_block_ids_with_load_errors() == {11, 12}
+    assert "req0" not in worker._recving_transfers
+    assert "req0" not in worker._recving_transfers_callback_addr
+    assert "req0" not in worker._recving_transfer_local_block_ids
+
+
+def test_read_blocks_setup_exception_notifies_without_invalid_blocks() -> None:
+    worker = make_worker()
+    worker.tp_rank = 2
+    worker.dp_rank = 0
+    worker.kv_caches = {"layer0": FakeTensor()}
+    worker.layer_name_to_local_kv_cache_metadata = {"layer0": []}
+    worker._get_built_session = lambda _engine_id: (
+        ["session0"],
+        SimpleNamespace(num_blocks=1, block_len=1),
+    )
+    worker._compute_block_transfer_offsets = lambda *_args: ([0], [0], [1])
+    worker.moriio_wrapper.read_error = RuntimeError("setup failed")
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        worker._read_blocks(
+            local_block_ids=[11, 12],
+            remote_block_ids=[21, 22],
+            dst_engine_id="remote",
+            request_id="req0",
+            transfer_id="transfer0",
+            remote_host="host",
+            remote_notify_port=61005,
+            remote_dp_rank=1,
+            remote_tp_size=16,
+        )
+
+    assert worker.moriio_wrapper.notifies == [("transfer0", "host", "61023")]
+    assert worker.get_block_ids_with_load_errors() == set()
+    assert "req0" not in worker._recving_transfers
+    assert "req0" not in worker._recving_transfers_callback_addr
+    assert "req0" not in worker._recving_transfer_local_block_ids

@@ -162,8 +162,18 @@ class TransferError(MoRIIOError):
     pass
 
 
-def get_moriio_mode() -> MoRIIOMode:
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def get_moriio_mode(extra_config: dict[str, Any] | None = None) -> MoRIIOMode:
     read_mode = envs.VLLM_MORIIO_CONNECTOR_READ_MODE
+    if extra_config is not None and "read_mode" in extra_config:
+        read_mode = _as_bool(extra_config["read_mode"])
     logger.debug("MoRIIO Connector read_mode: %s", read_mode)
     if read_mode:
         return MoRIIOMode.READ
@@ -214,7 +224,7 @@ class MoRIIOConfig:
         base_notify_port = int(extra_config["notify_port"])
         dp_size = vllm_config.parallel_config.data_parallel_size
         tp_size = get_tensor_model_parallel_world_size()
-        port_offset = get_port_offset(dp_rank, tp_rank)
+        port_offset = get_port_offset(dp_rank, tp_rank, tp_size)
 
         return cls(
             local_ip=get_ip(),
