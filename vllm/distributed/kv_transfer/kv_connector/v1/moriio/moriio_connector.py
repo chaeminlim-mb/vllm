@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import queue
+import re
 import threading
 import time
 from collections import defaultdict
@@ -71,6 +72,18 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+_TRANSFER_ID_RE = re.compile(
+    r"(tx-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+_VLLM_REQUEST_SUFFIX_RE = re.compile(r"(.+)-[0-9a-fA-F]{8}$")
+
+
+def _strip_vllm_request_suffix(request_id: str) -> str:
+    match = _VLLM_REQUEST_SUFFIX_RE.fullmatch(request_id)
+    return match.group(1) if match is not None else request_id
+
 
 try:
     from mori.io import (
@@ -926,18 +939,76 @@ class MoRIIOConnectorWorker:
             use_mla=self.use_mla,
         )
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
-        # READ-mode producer: buffer transfer_ids whose decode-side notify
+        self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
+        # READ-mode producer: buffer completion ids whose decode-side notify
         # arrived BEFORE start_load_kv populated transfer_id_to_request_id.
         # Without this, get_finished() drops the notification → scheduler
         # never marks the request done_sending → producer KV blocks leak →
         # KV cache fills at high concurrency (hard wedge on prefill side at
         # c>=128 in DP8EP 8K-input runs). Retried on every get_finished
-        # call until mapping is populated.
-        self._pending_unmapped_done_tids: set[TransferId] = set()
+        # call until mapping is populated. The normal id is transfer_id, but
+        # older paths may deliver a wrapped transfer id or request id.
+        self._pending_unmapped_done_tids: set[str] = set()
 
         # TODO: consider the integration of flashinfer or other backends.
         self.backend_name = backend.get_name()
         logger.debug("Detected attention backend %s", self.backend_name)
+
+    def _remember_transfer_mapping(
+        self, transfer_id: TransferId, request_id: ReqId
+    ) -> None:
+        self.transfer_id_to_request_id[transfer_id] = request_id
+        self.request_id_to_transfer_id[request_id] = transfer_id
+        external_request_id = _strip_vllm_request_suffix(request_id)
+        if external_request_id != request_id:
+            self.request_id_to_transfer_id.setdefault(
+                external_request_id, transfer_id
+            )
+
+    def _forget_transfer_mapping(
+        self, transfer_id: TransferId, request_id: ReqId | None = None
+    ) -> None:
+        if request_id is None:
+            request_id = self.transfer_id_to_request_id.get(transfer_id)
+        self.transfer_id_to_request_id.pop(transfer_id, None)
+        if request_id is None:
+            return
+        self.request_id_to_transfer_id.pop(request_id, None)
+        external_request_id = _strip_vllm_request_suffix(request_id)
+        if external_request_id != request_id:
+            mapped_transfer_id = self.request_id_to_transfer_id.get(
+                external_request_id
+            )
+            if mapped_transfer_id == transfer_id:
+                self.request_id_to_transfer_id.pop(external_request_id, None)
+
+    def _pop_mapped_completion_id(self, completion_id: str) -> ReqId | None:
+        request_id = self.transfer_id_to_request_id.get(completion_id)
+        if request_id is not None:
+            self._forget_transfer_mapping(completion_id, request_id)
+            return request_id
+
+        match = _TRANSFER_ID_RE.search(completion_id)
+        if match is not None:
+            transfer_id = match.group(1)
+            request_id = self.transfer_id_to_request_id.get(transfer_id)
+            if request_id is not None:
+                self._forget_transfer_mapping(transfer_id, request_id)
+                return request_id
+
+        transfer_id = self.request_id_to_transfer_id.get(completion_id)
+        if transfer_id is None:
+            transfer_id = self.request_id_to_transfer_id.get(
+                _strip_vllm_request_suffix(completion_id)
+            )
+        if transfer_id is None:
+            return None
+        request_id = self.transfer_id_to_request_id.get(transfer_id)
+        if request_id is None:
+            self.request_id_to_transfer_id.pop(completion_id, None)
+            return None
+        self._forget_transfer_mapping(transfer_id, request_id)
+        return request_id
 
     def schedule_write_blocks(
         self,
@@ -1476,7 +1547,7 @@ class MoRIIOConnectorWorker:
                 )
                 self._pending_unmapped_done_tids = set()
                 for tid in candidate_tids:
-                    mapped = self.transfer_id_to_request_id.pop(tid, None)
+                    mapped = self._pop_mapped_completion_id(tid)
                     if mapped is not None:
                         done_sending.add(mapped)
                     else:
@@ -1523,7 +1594,7 @@ class MoRIIOConnectorWorker:
         translated_recving: set[str] = set()
         matched_xfer_ids: set[str] = set()
         for tid in done_recving:
-            mapped = self.transfer_id_to_request_id.pop(tid, None)
+            mapped = self._pop_mapped_completion_id(tid)
             if mapped is not None:
                 translated_recving.add(mapped)
                 matched_xfer_ids.add(tid)
@@ -1680,7 +1751,7 @@ class MoRIIOConnectorWorker:
                     # never sees this id and never pops. Without an
                     # explicit pop here the map grows unbounded for the
                     # lifetime of the engine.
-                    self.transfer_id_to_request_id.pop(xfer_id, None)
+                    self._forget_transfer_mapping(xfer_id)
 
                     to_remove.append(req_id)
                 elif failed_status is not None:
@@ -1781,7 +1852,8 @@ class MoRIIOConnectorWorker:
         # request_id, and that notification can arrive several steps after
         # request_finished. get_finished() pops entries after a successful
         # translation, so the dict stays bounded.
-        self.transfer_id_to_request_id.update(metadata.transfer_id_to_request_id)
+        for transfer_id, req_id in metadata.transfer_id_to_request_id.items():
+            self._remember_transfer_mapping(transfer_id, req_id)
         if self.is_producer:
             self.moriio_wrapper.async_wait_reqid()
             return
