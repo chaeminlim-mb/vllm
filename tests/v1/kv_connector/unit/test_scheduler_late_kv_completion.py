@@ -9,15 +9,20 @@ class DummyConnector:
 
     def __init__(self) -> None:
         self.outputs: list[KVConnectorOutput] = []
+        self.pending_deferred_sends = False
 
     def update_connector_output(self, output: KVConnectorOutput) -> None:
         self.outputs.append(output)
+
+    def has_pending_deferred_sends(self) -> bool:
+        return self.pending_deferred_sends
 
 
 def make_scheduler(requests: dict[str, object] | None = None) -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.connector = DummyConnector()
     scheduler.requests = requests or {}
+    scheduler.finished_req_ids = set()
     scheduler.finished_recving_kv_req_ids = set()
     return scheduler
 
@@ -62,3 +67,12 @@ def test_live_finished_recving_still_marks_waiting_request() -> None:
         KVConnectorOutput(finished_recving={"live"}))
 
     assert scheduler.finished_recving_kv_req_ids == {"live"}
+
+
+def test_pending_deferred_send_keeps_scheduler_active() -> None:
+    scheduler = make_scheduler()
+    assert not scheduler.has_finished_requests()
+
+    scheduler.connector.pending_deferred_sends = True
+
+    assert scheduler.has_finished_requests()

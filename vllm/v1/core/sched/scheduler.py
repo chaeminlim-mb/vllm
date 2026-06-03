@@ -1961,7 +1961,16 @@ class Scheduler(SchedulerInterface):
         return num_waiting + len(self.running)
 
     def has_finished_requests(self) -> bool:
-        return len(self.finished_req_ids) > 0
+        if self.finished_req_ids:
+            return True
+        if self.connector is None:
+            return False
+        has_pending_deferred_sends = getattr(
+            self.connector, "has_pending_deferred_sends", None
+        )
+        return bool(
+            has_pending_deferred_sends and has_pending_deferred_sends()
+        )
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

@@ -280,6 +280,11 @@ class MoRIIOConnector(KVConnectorBase_V1):
         # A request's KV transfer spans its TP group, not every DP/EP worker.
         return self._vllm_config.parallel_config.tensor_parallel_size
 
+    def has_pending_deferred_sends(self) -> bool:
+        if self.connector_scheduler is None:
+            return False
+        return self.connector_scheduler.has_pending_deferred_sends()
+
 
 class MoRIIOConnectorScheduler:
     """Implementation of Scheduler side methods"""
@@ -351,6 +356,13 @@ class MoRIIOConnectorScheduler:
                 "defer_timeout", MoRIIOConstants.DEFAULT_DEFER_TIMEOUT
             )
         )
+        self._defer_drain_grace = float(
+            self.kv_transfer_config.kv_connector_extra_config.get(
+                "defer_drain_grace",
+                os.environ.get("VLLM_MORIIO_DEFER_DRAIN_GRACE_S", "2.0"),
+            )
+        )
+        self._deferred_send_drain_until = 0.0
         self.paths: dict[str, zmq.Socket] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
@@ -669,8 +681,13 @@ class MoRIIOConnectorScheduler:
                 time.perf_counter()
                 + MoRIIOConstants.VLLM_MORI_READ_ABORT_REQUEST_TIMEOUT
             )
+            now = time.monotonic()
             self._deferred_send_deadlines[request.request_id] = (
-                time.monotonic() + self._defer_timeout
+                now + self._defer_timeout
+            )
+            self._deferred_send_drain_until = max(
+                self._deferred_send_drain_until,
+                now + self._defer_drain_grace,
             )
 
         # Return KV transfer params forwarded verbatim to the decode instance by
@@ -719,6 +736,10 @@ class MoRIIOConnectorScheduler:
         for req_id in connector_output.finished_sending or ():
             self._deferred_send_deadlines.pop(req_id, None)
 
+        if not self._deferred_send_deadlines:
+            self._deferred_send_drain_until = 0.0
+            return
+
         now = time.monotonic()
         expired_reqs = [
             req_id
@@ -736,12 +757,22 @@ class MoRIIOConnectorScheduler:
             del self._deferred_send_deadlines[req_id]
             if self.is_producer:
                 self.unmap_request_id(req_id)
+        if not self._deferred_send_deadlines:
+            self._deferred_send_drain_until = 0.0
         logger.warning(
             "Reaped %d deferred sends with no finished_sending notification "
             "after %.0fs. This indicates lost async KV completion "
             "notifications from the KV connector.",
             len(expired_reqs),
             self._defer_timeout,
+        )
+
+    def has_pending_deferred_sends(self) -> bool:
+        if not self._deferred_send_deadlines:
+            return False
+        now = time.monotonic()
+        return now < self._deferred_send_drain_until or any(
+            now >= deadline for deadline in self._deferred_send_deadlines.values()
         )
 
 
