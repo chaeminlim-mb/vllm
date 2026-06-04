@@ -90,6 +90,13 @@ class KVOutputAggregator:
         aggregated_kv_connector_worker_meta = None
         combined_kv_cache_events = None
         invalid_block_ids = set[int]()
+        # PD stage-3 telemetry: merge per-request KV-transfer timestamps across
+        # all workers. Each req's RDMA transfer is stamped on exactly the worker
+        # that owns its blocks, so req_ids are largely disjoint; union them and
+        # merge the inner {start,complete,complete_wallclock} dicts on collision.
+        # Without this the rebuilt KVConnectorOutput below would drop the field
+        # entirely (only the explicitly-listed fields survive aggregation).
+        aggregated_kv_xfer_event_ts: dict[str, dict[str, float]] = {}
         for model_runner_output in outputs:
             assert model_runner_output is not None
             kv_output = model_runner_output.kv_connector_output
@@ -156,6 +163,9 @@ class KVOutputAggregator:
 
             invalid_block_ids |= kv_output.invalid_block_ids
 
+            for req_id, ts_dict in (kv_output.kv_xfer_event_ts or {}).items():
+                aggregated_kv_xfer_event_ts.setdefault(req_id, {}).update(ts_dict)
+
         # select output of the worker specified by output_rank
         output = outputs[output_rank]
 
@@ -168,6 +178,7 @@ class KVOutputAggregator:
             kv_connector_worker_meta=aggregated_kv_connector_worker_meta or None,
             invalid_block_ids=invalid_block_ids,
             expected_finished_count=self._expected_finished_count,
+            kv_xfer_event_ts=aggregated_kv_xfer_event_ts,
         )
 
         return output

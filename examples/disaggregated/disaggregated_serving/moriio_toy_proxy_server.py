@@ -340,6 +340,13 @@ async def handle_request(api: str, request: Request):
             req_data["kv_transfer_params"]["remote_hosts"] = prefill_kv.get(
                 "remote_hosts"
             )
+            # Forward P-side wall-clock prefill-completion stamp so D-side
+            # PD breakdown sees stage-3 cross-node sanity check.
+            prefill_complete_ts = prefill_kv.get("prefill_complete_ts")
+            if prefill_complete_ts is not None:
+                req_data["kv_transfer_params"]["prefill_complete_ts"] = (
+                    prefill_complete_ts
+                )
         prefill_hosts = prefill_instance_endpoint.get("node_hosts") or []
         if prefill_hosts:
             req_data["kv_transfer_params"]["remote_hosts"] = list(prefill_hosts)

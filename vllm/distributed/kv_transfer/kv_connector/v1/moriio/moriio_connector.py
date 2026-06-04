@@ -208,6 +208,17 @@ class MoRIIOConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         return self.connector_worker.get_block_ids_with_load_errors()
 
+    def take_kv_xfer_event_ts(self) -> dict[str, dict[str, float]]:
+        """Drain per-request KV-transfer timing stamps (D-side PD telemetry).
+
+        Returns the side-channel dict packed into
+        KVConnectorOutput.kv_xfer_event_ts. Empty when no stamps accumulated
+        this step (P-side or non-PD setups).
+        """
+        if self.connector_worker is None:
+            return {}
+        return self.connector_worker.take_kv_xfer_event_ts()
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         if self.mode == MoRIIOMode.WRITE and get_role() == ROLE.CONSUMER:
@@ -894,6 +905,22 @@ class MoRIIOConnectorWorker:
         self._recving_transfers_callback_addr: dict[ReqId, tuple[str, str, str]] = {}
         self._recving_transfer_local_block_ids: dict[ReqId, set[int]] = {}
         self._invalid_block_ids: queue.Queue[set[int]] = queue.Queue()
+
+        # PD stage-3 telemetry: monotonic + wall-clock timestamps for the
+        # READ-mode KV transfer per request. Populated under
+        # self.moriio_wrapper.lock at:
+        #   - _read_blocks_for_req() right before the RDMA READ kicks off
+        #     -> _kv_xfer_start_ts_mono[req_id] = time.monotonic()
+        #   - _pop_done_transfers() inside the all-statuses-Succeeded branch
+        #     -> _kv_xfer_complete_ts_mono[req_id] = time.monotonic()
+        #        _kv_xfer_complete_ts_wallclock[req_id] = time.time()
+        # Drained once per scheduler step via take_kv_xfer_event_ts() and
+        # surfaced into KVConnectorOutput.kv_xfer_event_ts; the scheduler
+        # then fires EngineCoreEventType.KV_XFER_{START,COMPLETE,
+        # COMPLETE_WALLCLOCK} events that drive stats.py PD-stage fields.
+        self._kv_xfer_start_ts_mono: dict[ReqId, float] = {}
+        self._kv_xfer_complete_ts_mono: dict[ReqId, float] = {}
+        self._kv_xfer_complete_ts_wallclock: dict[ReqId, float] = {}
 
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
@@ -1664,6 +1691,13 @@ class MoRIIOConnectorWorker:
                     # request_id_to_transfer_id inverse lookup that
                     # earlier Edwin's wedge fix used.
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
+                    # PD stage-3 telemetry: stamp completion as soon as all
+                    # per-layer statuses are Succeeded, BEFORE send_notify
+                    # (so a retry on send_notify failure does not move the
+                    # ts). First-stamp-wins.
+                    if req_id not in self._kv_xfer_complete_ts_mono:
+                        self._kv_xfer_complete_ts_mono[req_id] = time.monotonic()
+                        self._kv_xfer_complete_ts_wallclock[req_id] = time.time()
                     try:
                         self.moriio_wrapper.send_notify(xfer_id, host, port)
                     except Exception:
@@ -1702,6 +1736,38 @@ class MoRIIOConnectorWorker:
             except queue.Empty:
                 break
         return result
+
+    def take_kv_xfer_event_ts(self) -> dict[str, dict[str, float]]:
+        """Drain per-request KV-transfer timing stamps (D-side).
+
+        Returns the mapping consumed by KVConnectorOutput.kv_xfer_event_ts:
+            { req_id: { "start": mono, "complete": mono, "complete_wallclock": wall } }
+
+        Pop semantics: each (req_id, field) pair is reported exactly once.
+        Stamps are accumulated in three internal dicts under
+        self.moriio_wrapper.lock; this method moves them out under the same
+        lock so a stamp racing with a drain is observed cleanly on the next
+        tick. Returns {} when no transfers fired this step.
+
+        Read-only / no-op for the producer side (P never populates these
+        dicts in READ mode).
+        """
+        if not self._kv_xfer_start_ts_mono and not self._kv_xfer_complete_ts_mono:
+            return {}
+        out: dict[str, dict[str, float]] = {}
+        with self.moriio_wrapper.lock:
+            # Move-out the start stamps.
+            for req_id, ts in self._kv_xfer_start_ts_mono.items():
+                out.setdefault(req_id, {})["start"] = ts
+            self._kv_xfer_start_ts_mono.clear()
+            # Move-out the complete stamps (both monotonic + wallclock).
+            for req_id, ts in self._kv_xfer_complete_ts_mono.items():
+                out.setdefault(req_id, {})["complete"] = ts
+            self._kv_xfer_complete_ts_mono.clear()
+            for req_id, ts in self._kv_xfer_complete_ts_wallclock.items():
+                out.setdefault(req_id, {})["complete_wallclock"] = ts
+            self._kv_xfer_complete_ts_wallclock.clear()
+        return out
 
     def save_kv_layer(
         self,
@@ -1851,6 +1917,14 @@ class MoRIIOConnectorWorker:
         actual_remote_host = self._pick_host_for_dp_rank(
             meta, int(meta.remote_dp_rank)
         )
+        # PD stage-3 telemetry: stamp the D-engine monotonic clock just
+        # before the RDMA READ kicks off. Paired with the matching stamp
+        # inside _pop_done_transfers' success branch; together they give
+        # the NTP-independent kv_xfer_time. First-stamp-wins under the
+        # wrapper lock — retries of the same req should not overwrite.
+        with self.moriio_wrapper.lock:
+            if req_id not in self._kv_xfer_start_ts_mono:
+                self._kv_xfer_start_ts_mono[req_id] = time.monotonic()
         self._read_blocks(
             request_id=req_id,
             transfer_id=meta.transfer_id,

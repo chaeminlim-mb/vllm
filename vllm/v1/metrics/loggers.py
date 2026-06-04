@@ -917,6 +917,48 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             histogram_decode_time_request, per_engine_labelvalues
         )
 
+        # PD 5-stage breakdown — D-side stage 3,4,5 (D-only monotonic).
+        # Buckets re-use request_latency_buckets (covers ms to many seconds).
+        histogram_kv_xfer_time_request = self._histogram_cls(
+            name="vllm:request_kv_xfer_time_seconds",
+            documentation=(
+                "Histogram of stage 3 KV transfer time (D-side monotonic, "
+                "kv_xfer_complete_ts - kv_xfer_start_ts). PD READ mode."
+            ),
+            buckets=request_latency_buckets,
+            labelnames=labelnames,
+        )
+        self.histogram_kv_xfer_time_request = create_metric_per_engine(
+            histogram_kv_xfer_time_request, per_engine_labelvalues
+        )
+
+        histogram_decode_queue_time_post_kv_request = self._histogram_cls(
+            name="vllm:request_decode_queue_time_post_kv_seconds",
+            documentation=(
+                "Histogram of stage 4 D-side queue wait between KV xfer "
+                "complete and first decode forward. May be negative in "
+                "READ mode (admit-before-RDMA-done)."
+            ),
+            buckets=request_latency_buckets,
+            labelnames=labelnames,
+        )
+        self.histogram_decode_queue_time_post_kv_request = create_metric_per_engine(
+            histogram_decode_queue_time_post_kv_request, per_engine_labelvalues
+        )
+
+        histogram_decode_exec_time_post_kv_request = self._histogram_cls(
+            name="vllm:request_decode_exec_time_post_kv_seconds",
+            documentation=(
+                "Histogram of stage 5 D-side decode execution time after "
+                "first decode forward step."
+            ),
+            buckets=request_latency_buckets,
+            labelnames=labelnames,
+        )
+        self.histogram_decode_exec_time_post_kv_request = create_metric_per_engine(
+            histogram_decode_exec_time_post_kv_request, per_engine_labelvalues
+        )
+
         histogram_prefill_kv_computed_request = self._histogram_cls(
             name="vllm:request_prefill_kv_computed_tokens",
             documentation=(
@@ -1194,6 +1236,22 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.histogram_decode_time_request[engine_idx].observe(
                 finished_request.decode_time
             )
+            # PD 5-stage breakdown — only observe when populated (PD READ mode).
+            if finished_request.kv_xfer_time > 0.0:
+                self.histogram_kv_xfer_time_request[engine_idx].observe(
+                    finished_request.kv_xfer_time
+                )
+            # decode_queue_time_post_kv may be negative in READ admit-before-RDMA
+            # mode; histograms don't accept negative values, clamp to 0 here
+            # (the unclamped raw value lives on FinishedRequestStats for logs).
+            if finished_request.kv_xfer_complete_ts > 0.0:
+                self.histogram_decode_queue_time_post_kv_request[engine_idx].observe(
+                    max(finished_request.decode_queue_time_post_kv, 0.0)
+                )
+            if finished_request.decode_exec_time_post_kv > 0.0:
+                self.histogram_decode_exec_time_post_kv_request[engine_idx].observe(
+                    finished_request.decode_exec_time_post_kv
+                )
             # Calculate prefill KV compute (excludes cached tokens)
             prefill_kv_computed = finished_request.num_prompt_tokens - max(
                 finished_request.num_cached_tokens, 0

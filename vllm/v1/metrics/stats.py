@@ -8,11 +8,14 @@ from typing import TYPE_CHECKING, Any
 
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.logger import init_logger
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreEvent, EngineCoreOutput, FinishReason
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -222,11 +225,20 @@ class RequestStateStats:
     # PD breakdown — D-side only.
     # remote_prefill_complete_ts: wall-clock TS captured on P at request_finished
     # (prefill compute done), shipped via kv_transfer_params. NOT monotonic —
-    # comparable across nodes only with NTP-synced clocks.
-    # kv_xfer_complete_ts: engine-core monotonic TS captured on D when scheduler
-    # observes finished_recving for this request (KV_XFER_COMPLETE event).
+    # comparable across nodes only with NTP-synced clocks. Informational sanity
+    # check vs the D-only kv_xfer_time below.
+    # kv_xfer_start_ts: D-engine monotonic TS, when MoRIIO worker initiated
+    # RDMA READ. Set from KV_XFER_START event.
+    # kv_xfer_complete_ts: D-engine monotonic TS, when MoRIIO RDMA READ finished.
+    # Set from KV_XFER_COMPLETE event. Subtract from kv_xfer_start_ts for the
+    # primary D-only kv_xfer_time (NTP-independent).
+    # kv_xfer_complete_wallclock_ts: D-side wall-clock TS at same instant as
+    # kv_xfer_complete_ts. Pairs with remote_prefill_complete_ts for cross-node
+    # sanity check; emit WARNING if |kv_xfer_time - kv_xfer_time_wallclock| > 50ms.
     remote_prefill_complete_ts: float = 0.0
+    kv_xfer_start_ts: float = 0.0
     kv_xfer_complete_ts: float = 0.0
+    kv_xfer_complete_wallclock_ts: float = 0.0
 
 
 @dataclass
@@ -247,17 +259,27 @@ class FinishedRequestStats:
     is_corrupted: bool = False
     num_cached_tokens: int = 0
 
-    # PD 5-stage breakdown (D-side only; P-side fields above are reused on P).
+    # PD 5-stage breakdown (D-side; P-side fields use queued_time + prefill_time
+    # on the P engine, then ship results via KV transfer to D).
     # Stage 1 = queued_time (P engine)
     # Stage 2 = prefill_time (P engine)
-    # Stage 3 = kv_xfer_time (D engine: kv_xfer_complete_ts - remote_prefill_complete_ts)
-    # Stage 4 = decode_queue_time_post_kv (D engine: scheduled_ts - kv_xfer_complete_ts)
+    # Stage 3 = kv_xfer_time (D engine: kv_xfer_complete_ts - kv_xfer_start_ts,
+    #           both monotonic on D. NTP-independent. Primary stage-3 metric.)
+    # Stage 4 = decode_queue_time_post_kv (D engine: scheduled_ts - kv_xfer_complete_ts).
+    #           May be NEGATIVE in MoRIIO READ mode (load_kv_async=False admits
+    #           request to RUNNING before RDMA completes). Sign carries info:
+    #             positive → D scheduler made the request wait after KV arrived
+    #             negative → D scheduler admitted before KV arrived; the |value|
+    #                        is included in decode_exec_time_post_kv as wait time
     # Stage 5 = decode_exec_time_post_kv (D engine: last_token_ts - scheduled_ts)
-    # NOTE: stage 3 mixes wall-clock (P) and monotonic (D) clocks; only meaningful
-    # if both nodes use the same time source (e.g. NTP-synced wall-clock).
+    # kv_xfer_time_wallclock = kv_xfer_complete_wallclock_ts - remote_prefill_complete_ts.
+    # Cross-node wall-clock sanity check (NTP-dependent). Informational only.
     remote_prefill_complete_ts: float = 0.0
+    kv_xfer_start_ts: float = 0.0
     kv_xfer_complete_ts: float = 0.0
+    kv_xfer_complete_wallclock_ts: float = 0.0
     kv_xfer_time: float = 0.0
+    kv_xfer_time_wallclock: float = 0.0
     decode_queue_time_post_kv: float = 0.0
     decode_exec_time_post_kv: float = 0.0
 
@@ -447,10 +469,24 @@ class IterationStats:
             elif event.type == EngineCoreEventType.PREEMPTED:
                 self.num_preempted_reqs += 1
                 lora_states.request_waiting(req_id, lora_name)
+            elif event.type == EngineCoreEventType.KV_XFER_START:
+                # D-side only; emitted by scheduler when MoRIIO worker
+                # initiated the RDMA READ for this request. First-write wins
+                # to ignore any spurious retries.
+                if req_stats.kv_xfer_start_ts == 0.0:
+                    req_stats.kv_xfer_start_ts = event.timestamp
             elif event.type == EngineCoreEventType.KV_XFER_COMPLETE:
-                # D-side only; emitted by scheduler when finished_recving fires.
+                # D-side only; emitted by scheduler when MoRIIO RDMA READ
+                # completed. First-write wins (mirrors KV_XFER_START).
                 if req_stats.kv_xfer_complete_ts == 0.0:
                     req_stats.kv_xfer_complete_ts = event.timestamp
+            elif event.type == EngineCoreEventType.KV_XFER_COMPLETE_WALLCLOCK:
+                # Companion wall-clock TS to KV_XFER_COMPLETE. The
+                # event's .timestamp slot carries time.time() (NOT
+                # monotonic) — used only for the cross-node sanity check
+                # vs P's remote_prefill_complete_ts.
+                if req_stats.kv_xfer_complete_wallclock_ts == 0.0:
+                    req_stats.kv_xfer_complete_wallclock_ts = event.timestamp
 
     def update_from_finished_request(
         self,
@@ -486,17 +522,37 @@ class IterationStats:
         )
 
         # PD 5-stage breakdown (D-side). Stages are zero unless this is a
-        # decode-side finish in a PD setup. Stage 3 requires NTP-synced
-        # wall-clock between P and D.
+        # decode-side finish in a PD setup. Stage 3 uses D-only monotonic
+        # clock (kv_xfer_complete_ts - kv_xfer_start_ts) so it's
+        # NTP-independent. The optional kv_xfer_time_wallclock cross-checks
+        # against P's remote_prefill_complete_ts (wall-clock) when NTP
+        # alignment is available.
         kv_xfer_time = 0.0
+        kv_xfer_time_wallclock = 0.0
         decode_queue_time_post_kv = 0.0
         decode_exec_time_post_kv = 0.0
         if req_stats.kv_xfer_complete_ts > 0.0:
-            if req_stats.remote_prefill_complete_ts > 0.0:
+            # Primary: D-only monotonic stage-3 time.
+            if req_stats.kv_xfer_start_ts > 0.0:
                 kv_xfer_time = (
                     req_stats.kv_xfer_complete_ts
+                    - req_stats.kv_xfer_start_ts
+                )
+            # Optional sanity: cross-node wall-clock subtraction. Both ends
+            # need to be populated; otherwise leave 0.0.
+            if (
+                req_stats.remote_prefill_complete_ts > 0.0
+                and req_stats.kv_xfer_complete_wallclock_ts > 0.0
+            ):
+                kv_xfer_time_wallclock = (
+                    req_stats.kv_xfer_complete_wallclock_ts
                     - req_stats.remote_prefill_complete_ts
                 )
+            # Stage 4 — sign carries info; do NOT clamp to 0.
+            #   positive → D scheduler waited after KV arrived
+            #   negative → READ-mode admit-before-RDMA-done (load_kv_async=False)
+            #              the |value| is included in decode_exec_time_post_kv
+            #              as kernel-internal wait_for_layer_load time.
             decode_queue_time_post_kv = (
                 req_stats.scheduled_ts - req_stats.kv_xfer_complete_ts
             )
@@ -519,12 +575,32 @@ class IterationStats:
             is_corrupted=req_stats.is_corrupted,
             num_cached_tokens=num_cached_tokens,
             remote_prefill_complete_ts=req_stats.remote_prefill_complete_ts,
+            kv_xfer_start_ts=req_stats.kv_xfer_start_ts,
             kv_xfer_complete_ts=req_stats.kv_xfer_complete_ts,
+            kv_xfer_complete_wallclock_ts=req_stats.kv_xfer_complete_wallclock_ts,
             kv_xfer_time=kv_xfer_time,
+            kv_xfer_time_wallclock=kv_xfer_time_wallclock,
             decode_queue_time_post_kv=decode_queue_time_post_kv,
             decode_exec_time_post_kv=decode_exec_time_post_kv,
         )
         self.finished_requests.append(finished_req)
+
+        # PD 5-stage breakdown debug line. The Prometheus histograms (loggers.py)
+        # are the canonical sink, but they vanish if /metrics isn't scraped
+        # before container teardown — this log line survives via `docker logs`.
+        # Fires only on decode-side finishes that actually carried a KV transfer
+        # (kv_xfer_complete_ts set), so non-PD / prefill-side runs stay quiet.
+        # Recover the numbers post-run with: grep PD_BREAKDOWN <decode>.log
+        if req_stats.kv_xfer_complete_ts > 0.0:
+            logger.info(
+                "PD_BREAKDOWN req=%s kv_xfer=%.4f q_post_kv=%.4f "
+                "exec_post_kv=%.4f wc=%.4f",
+                request_id,
+                kv_xfer_time,
+                decode_queue_time_post_kv,
+                decode_exec_time_post_kv,
+                kv_xfer_time_wallclock,
+            )
 
         # Count corrupted requests when they finish (only once per request)
         if req_stats.is_corrupted:

@@ -208,6 +208,16 @@ class KVConnectorOutput:
     # It captures a static setup info and should almost always remain constant
     # for a given connector after discovery. Default value entails no change.
     expected_finished_count: int = 0
+    # Side-channel for per-request KV-transfer timing events surfaced from the
+    # worker to the scheduler. Outer key: req_id. Inner keys:
+    #   "start"    -> time.monotonic() float, when worker issued the RDMA READ
+    #   "complete" -> time.monotonic() float, when RDMA READ completed
+    #   "complete_wallclock" -> time.time() float, optional, for cross-node
+    #                           sanity check vs P's prefill_complete_ts
+    # Consumed in scheduler's _update_from_kv_xfer_finished to fire
+    # EngineCoreEventType.KV_XFER_START / KV_XFER_COMPLETE events on each
+    # tracked request — those events then drive stats.py PD-stage population.
+    kv_xfer_event_ts: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def is_empty(self):
         return (
@@ -217,6 +227,7 @@ class KVConnectorOutput:
             and not self.kv_cache_events
             and not self.invalid_block_ids
             and not self.kv_connector_worker_meta
+            and not self.kv_xfer_event_ts
         )
 
 

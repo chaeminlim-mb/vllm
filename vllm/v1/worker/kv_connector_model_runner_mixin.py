@@ -115,6 +115,12 @@ class KVConnectorModelRunnerMixin:
             output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
             output.kv_connector_worker_meta = kv_connector.build_connector_worker_meta()
 
+            # D-side PD telemetry: drain per-req KV-transfer timestamps if the
+            # connector exposes them (MoRIIO). No-op for connectors without it.
+            take_ts = getattr(kv_connector, "take_kv_xfer_event_ts", None)
+            if take_ts is not None:
+                output.kv_xfer_event_ts = take_ts()
+
             if not defer_finalize:
                 kv_connector.clear_connector_metadata()
 

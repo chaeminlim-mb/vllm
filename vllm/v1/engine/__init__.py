@@ -144,6 +144,18 @@ class EngineCoreEventType(enum.IntEnum):
     SCHEDULED = 2
     PREEMPTED = 3
     KV_XFER_COMPLETE = 4
+    # D-side only: MoRIIO worker about to issue the RDMA READ for a
+    # request's KV cache. Pairs with KV_XFER_COMPLETE to give a D-only
+    # monotonic measurement of stage 3 (KV transfer time) that doesn't
+    # depend on cross-node wall-clock sync.
+    KV_XFER_START = 5
+    # D-side only: companion wall-clock timestamp for KV_XFER_COMPLETE.
+    # Conveys time.time() in the event's .timestamp slot (deliberately —
+    # the EngineCoreEvent model carries one timestamp per event). Pairs
+    # with P-side remote_prefill_complete_ts (wall-clock, set in
+    # MoRIIOConnector.request_finished) for a cross-node sanity check on
+    # the D-only monotonic stage 3 value.
+    KV_XFER_COMPLETE_WALLCLOCK = 6
 
 
 class EngineCoreEvent(msgspec.Struct):

@@ -2226,6 +2226,43 @@ class Scheduler(SchedulerInterface):
             assert req_id in self.requests
             self._free_blocks(self.requests[req_id])
 
+        # PD stage 3 telemetry: drain the per-request KV-transfer event
+        # timestamps surfaced by the worker connector (e.g. MoRIIO READ-mode
+        # start/complete monotonic stamps) and fire matching EngineCoreEvents
+        # so RequestStateStats can populate kv_xfer_{start,complete}_ts.
+        #
+        # READ mode in MoRIIO does NOT report done_recving (see chaemin's
+        # f8be6829f), so we cannot rely on the finished_recving loop above
+        # for stage-3 timing. The side-channel kv_xfer_event_ts is the
+        # decoupled path: worker stamps independently and pushes via this
+        # dict; scheduler turns each stamp into a record_event on the
+        # tracked request without changing request state transitions.
+        if self.log_stats and kv_connector_output.kv_xfer_event_ts:
+            from vllm.v1.engine import EngineCoreEventType
+
+            for req_id, ts_dict in kv_connector_output.kv_xfer_event_ts.items():
+                # Request may have already finished/aborted between the
+                # worker stamping and the scheduler reading the dict.
+                req = self.requests.get(req_id)
+                if req is None:
+                    continue
+                ts_start = ts_dict.get("start")
+                if ts_start is not None:
+                    req.record_event(
+                        EngineCoreEventType.KV_XFER_START, ts_start
+                    )
+                ts_complete = ts_dict.get("complete")
+                if ts_complete is not None:
+                    req.record_event(
+                        EngineCoreEventType.KV_XFER_COMPLETE, ts_complete
+                    )
+                ts_complete_wc = ts_dict.get("complete_wallclock")
+                if ts_complete_wc is not None:
+                    req.record_event(
+                        EngineCoreEventType.KV_XFER_COMPLETE_WALLCLOCK,
+                        ts_complete_wc,
+                    )
+
     def _update_requests_with_invalid_blocks(
         self,
         requests: Iterable[Request],
