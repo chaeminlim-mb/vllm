@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import vllm.envs as envs
 from vllm.v1.attention.backend import AttentionCGSupport
@@ -76,3 +77,43 @@ def test_rocm_aiter_mla_without_mtp_keeps_single_only_decode():
     assert AiterMLAMetadataBuilder._mtp_decode_query_len(config) is None
     assert not AiterMLAMetadataBuilder._split_uniform_mtp_decode(config)
     assert not AiterMLAMetadataBuilder._allow_uniform_mtp_decode(config)
+
+
+def test_rocm_aiter_mtp_decode_detects_full_cg_padding_rows():
+    qo_len = torch.tensor([4, 4, 0, 0], dtype=torch.int32)
+
+    assert AiterMLAMetadataBuilder._needs_uniform_mtp_padding(
+        qo_len, max_qo_len=4, num_decode_tokens=16
+    )
+
+
+def test_rocm_aiter_mtp_decode_detects_all_padded_full_cg_rows():
+    qo_len = torch.tensor([0, 0, 0, 0], dtype=torch.int32)
+
+    assert (
+        AiterMLAMetadataBuilder._uniform_padded_mtp_qo_len(
+            qo_len, max_qo_len=0, num_decode_tokens=16
+        )
+        == 4
+    )
+
+
+@pytest.mark.parametrize(
+    ("qo_len", "max_qo_len", "num_decode_tokens"),
+    [
+        ([4, 4], 4, 8),
+        ([4, 3, 0], 4, 12),
+        ([1, 1, 0], 1, 3),
+        ([4, 4, 0, 0], 4, 8),
+        ([4, 4, 0, 0], 4, 20),
+        ([4, 0, 4, 0], 4, 16),
+    ],
+)
+def test_rocm_aiter_mtp_decode_padding_rejects_non_full_cg_cases(
+    qo_len, max_qo_len, num_decode_tokens
+):
+    assert not AiterMLAMetadataBuilder._needs_uniform_mtp_padding(
+        torch.tensor(qo_len, dtype=torch.int32),
+        max_qo_len=max_qo_len,
+        num_decode_tokens=num_decode_tokens,
+    )
