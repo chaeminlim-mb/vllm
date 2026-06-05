@@ -6453,6 +6453,29 @@ class GPUModelRunner(
             torch.accelerator.synchronize()
             end_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
+        # ROCTracer drain — force teardown of any per-piece capture-time
+        # torch.profiler state before steady-state /start_profile reuses
+        # ROCTracer. Per-piece `with profiler:` in _warmup_and_capture cycles
+        # init/teardown ~100x; ROCm's roctracer_open_pool + register_client
+        # leak callback-table state across cycles. Without explicit del + gc
+        # + cuda sync here, the steady-state TorchProfilerWrapper.stop() at
+        # bench /stop_profile time hits a poisoned ROCTracer state and
+        # segfaults (kills the prefill engine before traces flush).
+        # Symptoms: stochastic 5/8 to 6/8 DP-rank trace flush + the
+        # "External init callback must run in same thread as registerClient"
+        # error. Drop the capture profiler ref explicitly here so its
+        # ROCTracer session is fully released before steady-state inits.
+        if enable_profiler:
+            del profiler
+            import gc
+            gc.collect()
+            torch.cuda.synchronize()
+            logger.info(
+                "Rank %d: capture-time torch.profiler released, "
+                "ROCTracer state drained",
+                local_rank,
+            )
+
         # Disable cudagraph capturing globally, so any unexpected cudagraph
         # capturing will be detected and raise an error after here.
         # Note: We don't put it into graph_capture context manager because
