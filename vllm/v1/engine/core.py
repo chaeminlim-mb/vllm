@@ -1236,11 +1236,11 @@ class EngineCoreProc(EngineCore):
         # Post-step hook.
         self.post_step(model_executed)
 
-        # If no model execution happened but there are waiting requests
-        # (e.g., WAITING_FOR_REMOTE_KVS), yield the GIL briefly to allow
-        # background threads (like NIXL handshake) to make progress.
+        # If no model execution happened but the scheduler still has work
+        # (e.g., WAITING_FOR_REMOTE_KVS or pending KV completion drain),
+        # yield the GIL briefly to allow background threads to make progress.
         # Without this, the tight polling loop can starve background threads.
-        if not model_executed and self.scheduler.has_unfinished_requests():
+        if not model_executed and self.scheduler.has_requests():
             time.sleep(0.001)
 
         return model_executed

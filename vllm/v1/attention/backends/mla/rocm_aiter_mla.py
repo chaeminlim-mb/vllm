@@ -103,7 +103,7 @@ class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     attn_out_dtype: torch.dtype = torch.bfloat16
     # The max query output length: int
     max_qo_len: int | None = None
-    # Whether persistent MLA metadata was computed (only for qseqlen=1)
+    # Whether persistent MLA metadata was computed and can be passed to AITER.
     has_persistent_metadata: bool = False
 
 
@@ -134,6 +134,8 @@ class AiterMLAMetadata(MLACommonMetadata[AiterMLADecodeMetadata]):
 
 # Tile size used by the mla_prefill_ps_asm_fwd assembly kernel.
 _FP8_PREFILL_TILE_Q = 256
+_MAX_NATIVE_MTP_DECODE_QUERY_LEN = 4
+_DEFAULT_MLA_NUM_KV_SPLITS = 32
 
 
 class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
@@ -142,9 +144,11 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = (
         AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
-    # The ROCm AITER MLA decode kernel is reliable for qlen=1. MTP verification
-    # presents qlen>1 and can corrupt TP8 logits through native mla_decode_fwd,
-    # so TP MTP batches below are split into independent qlen=1 decode rows.
+    # MTP verification presents uniform qlen>1 decode batches. AITER's dense
+    # MLA decode path supports those batches when vLLM supplies causal
+    # persistent metadata, so keep the native row layout by default. A qlen=1
+    # split fallback remains available for deployments that still need the old
+    # correctness workaround.
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.SINGLE_ONLY
 
     @classmethod
@@ -170,7 +174,10 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         return (
             mtp_query_len is not None
             and mtp_query_len > 1
-            and vllm_config.parallel_config.tensor_parallel_size > 1
+            and (
+                envs.VLLM_AITER_MLA_MTP_DECODE_SPLIT
+                or mtp_query_len > _MAX_NATIVE_MTP_DECODE_QUERY_LEN
+            )
         )
 
     @classmethod
@@ -178,12 +185,66 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         mtp_query_len = cls._mtp_decode_query_len(vllm_config)
         if mtp_query_len is None:
             return False
+        if mtp_query_len <= 1:
+            return vllm_config.parallel_config.tensor_parallel_size == 1
 
-        # TP=1 uses AITER's native uniform qlen decode path. TP>1 takes the
-        # split metadata path below so the kernel still sees qlen=1 rows.
+        # Native dense MLA can consume uniform MTP qlen>1 batches up to the
+        # qlen covered by AITER persistent MLA tests. Larger qlen values use
+        # the split fallback below, preserving this same UNIFORM_BATCH
+        # scheduler contract while presenting qlen=1 rows to AITER.
+        return True
+
+    @staticmethod
+    def _uniform_padded_mtp_qo_len(
+        qo_len: torch.Tensor,
+        max_qo_len: int,
+        num_decode_tokens: int,
+    ) -> int:
+        num_reqs = qo_len.numel()
+        if num_reqs == 0 or num_decode_tokens <= 0:
+            return 0
+
+        # Full-CG pads q to a captured token count while leaving
+        # query_start_loc flat for dummy requests. Only synthesize dummy rows
+        # when every padded request maps to the same qlen and the q buffer has
+        # exactly that many rows.
+        if num_decode_tokens <= int(qo_len.sum().item()):
+            return 0
+        if num_decode_tokens % num_reqs != 0:
+            return 0
+
+        uniform_qo_len = num_decode_tokens // num_reqs
+        if uniform_qo_len <= 1:
+            return 0
+
+        positive_qo_len = qo_len[qo_len > 0]
+        if positive_qo_len.numel() == qo_len.numel():
+            return 0
+        if positive_qo_len.numel() > 0:
+            if max_qo_len != uniform_qo_len:
+                return 0
+            if not torch.all(positive_qo_len == uniform_qo_len):
+                return 0
+
+        zero_positions = torch.nonzero(qo_len == 0, as_tuple=False).flatten()
+        if zero_positions.numel() > 0:
+            first_zero = int(zero_positions[0].item())
+            if torch.any(qo_len[first_zero:] > 0):
+                return 0
+
+        return uniform_qo_len
+
+    @staticmethod
+    def _needs_uniform_mtp_padding(
+        qo_len: torch.Tensor,
+        max_qo_len: int,
+        num_decode_tokens: int,
+    ) -> bool:
         return (
-            vllm_config.parallel_config.tensor_parallel_size == 1
-            or cls._split_uniform_mtp_decode(vllm_config)
+            AiterMLAMetadataBuilder._uniform_padded_mtp_qo_len(
+                qo_len, max_qo_len, num_decode_tokens
+            )
+            > 0
         )
 
     @classmethod
@@ -262,13 +323,30 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # make sure get_mla_metadata_info_v1 / get_mla_metadata_v1 are consistent
         # with the actual tensor shape passed to mla_decode_fwd.
         self._num_attention_heads = max(16, self.num_heads)
-        q_dtype = self.decode_attn_out_dtype
         kv_cache_dtype_str = getattr(vllm_config.cache_config, "cache_dtype", "auto")
         if kv_cache_dtype_str in ("fp8", "fp8_e4m3", "fp8_e5m2"):
             kv_cache_dtype_str = "fp8"
+            kv_dtype = dtypes.fp8
         else:
-            kv_cache_dtype_str = "bf16"
-        kv_dtype = dtypes.d_dtypes.get(kv_cache_dtype_str, dtypes.bf16)
+            kv_dtype = {
+                torch.float16: dtypes.fp16,
+                torch.bfloat16: dtypes.bf16,
+            }.get(kv_cache_spec.dtype, kv_cache_spec.dtype)
+        # MLAAttention quantizes decode Q to FP8 before calling this backend
+        # whenever the KV cache is FP8 and supports_quant_query_input is true.
+        q_dtype = (
+            dtypes.fp8
+            if kv_cache_dtype_str == "fp8"
+            else self.decode_attn_out_dtype
+        )
+        self._mla_metadata_q_dtype = q_dtype
+        self._mla_metadata_kv_dtype = kv_dtype
+        max_metadata_batch_size = (
+            max_decode_rows if self._split_mtp_decode else max_num_reqs
+        )
+        max_metadata_qo_len = (
+            1 if self._split_mtp_decode else self._mtp_decode_query_len
+        )
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -277,8 +355,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
         ) = get_mla_metadata_info_v1(
-            max_num_reqs,
-            1,
+            max_metadata_batch_size,
+            max_metadata_qo_len,
             self._num_attention_heads,
             q_dtype,
             kv_dtype,
@@ -322,6 +400,19 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             self.qo_indptr = torch.zeros(
                 max_decode_rows + 1, dtype=torch.int32, device=device
             )
+
+    def _max_split_per_batch(self, batch_size: int) -> int:
+        if self._num_attention_heads < 128 or batch_size <= 0:
+            return -1
+        device_properties = torch.cuda.get_device_properties(self.device)
+        cu_num = device_properties.multi_processor_count
+        return max(
+            1,
+            min(
+                (cu_num + batch_size - 1) // batch_size,
+                _DEFAULT_MLA_NUM_KV_SPLITS,
+            ),
+        )
 
     def _init_fp8_prefill_ps_buffers(
         self,
@@ -493,6 +584,12 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         num_reqs = seq_lens_device.size(0)
         qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         max_qo_len = qo_len.max().item()
+        padded_mtp_qo_len = self._uniform_padded_mtp_qo_len(
+            qo_len, max_qo_len, num_decode_tokens
+        )
+        if padded_mtp_qo_len > 0:
+            max_qo_len = padded_mtp_qo_len
+        pad_uniform_mtp = padded_mtp_qo_len > 0
 
         split_mtp_decode = self._split_mtp_decode and max_qo_len > 1
         if split_mtp_decode:
@@ -516,6 +613,16 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         else:
             seq_lens_for_kernel = seq_lens_device
             num_kernel_reqs = num_reqs
+            if pad_uniform_mtp:
+                qo_lens_device = (
+                    query_start_loc_device[1 : num_reqs + 1]
+                    - query_start_loc_device[:num_reqs]
+                ).to(torch.int32)
+                seq_lens_for_kernel = torch.where(
+                    qo_lens_device > 0,
+                    seq_lens_for_kernel,
+                    seq_lens_for_kernel.new_full((), max_qo_len),
+                )
 
         # The aiter kernel always operates with page_size=1 (the wrapper
         # flattens kv_buffer). last_page_len is always 1.
@@ -559,7 +666,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 block_table_tensor,
                 block_table_tensor.stride(0),
                 paged_kv_indptr,
-                seq_lens_device,
+                seq_lens_for_kernel,
                 KERNEL_BLOCK_SIZE=self.kernel_block_size,
                 BLOCK_SIZE=1024,
             )
@@ -584,7 +691,16 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                     device=device,
                 )
             else:
-                qo_indptr_src = query_start_loc_device[: 1 + num_kernel_reqs]
+                if pad_uniform_mtp:
+                    qo_indptr_src = torch.arange(
+                        0,
+                        (num_kernel_reqs + 1) * max_qo_len,
+                        step=max_qo_len,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                else:
+                    qo_indptr_src = query_start_loc_device[: 1 + num_kernel_reqs]
             self.qo_indptr[: 1 + num_kernel_reqs].copy_(
                 qo_indptr_src, non_blocking=True
             )
@@ -601,28 +717,39 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                     device=device,
                 )
             else:
-                qo_indptr = query_start_loc_device[: 1 + num_kernel_reqs]
+                if pad_uniform_mtp:
+                    qo_indptr = torch.arange(
+                        0,
+                        (num_kernel_reqs + 1) * max_qo_len,
+                        step=max_qo_len,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                else:
+                    qo_indptr = query_start_loc_device[: 1 + num_kernel_reqs]
 
-        # The aiter MLA ASM kernel only supports qseqlen=1 (single-token
-        # decode). With speculative decoding, the verification step has
-        # qseqlen > 1 (e.g. 8 for spec7). get_mla_metadata_v1 calls
-        # get_heuristic_kernel_mla which fails for qseqlen > 1.
-        # We track whether persistent metadata was successfully computed
-        # so forward_mqa can skip passing it (falling back to the kernel
-        # computing its own metadata internally, like v0.18.0).
-        # MAF H1 WORKAROUND: forcibly skip the persistent-metadata fast path.
-        # On gfx942 with DP=8 (each rank has full nhead=128), the persistent
-        # qh128 MLA ASM kernel (`mla_a8w8_qh128_m32x4_n16x2_msk0_ps`) faults
-        # with "Write access to a read-only page" during warmup. With the
-        # env flag off, the kernel computes metadata internally (v0.18.0
-        # path) — slightly slower but stable. Re-enable by setting
-        # VLLM_AITER_MLA_PERSISTENT_METADATA=1. We resolve via vllm.envs
-        # (`_use_persistent_metadata` cached at class scope) rather than
-        # `os.getenv` here because this builder runs once per decode batch.
+        # For native MTP verification (qlen>1), pass persistent metadata so
+        # AITER gets explicit causal boundaries for each request instead of
+        # relying on the non-persistent qlen path. For ordinary qlen=1 decode,
+        # keep persistent metadata opt-in because the historical gfx942 qh128
+        # path could fault during warmup on some deployments.
         has_persistent_metadata = False
-        if max_qo_len == 1 and not split_mtp_decode and self._use_persistent_metadata:
+        use_persistent_metadata = (
+            (
+                max_qo_len > 1
+                and max_qo_len <= self._mtp_decode_query_len
+                and not split_mtp_decode
+            )
+            or (max_qo_len == 1 and self._use_persistent_metadata)
+        )
+        if use_persistent_metadata:
             from aiter import get_mla_metadata_v1
 
+            uni_qo_len = (
+                max_qo_len
+                if pad_uniform_mtp or torch.all(qo_len == max_qo_len)
+                else -1
+            )
             get_mla_metadata_v1(
                 qo_indptr,
                 paged_kv_indptr,
@@ -639,8 +766,11 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 page_size=1,
                 kv_granularity=16,
                 max_seqlen_qo=max_qo_len,
-                uni_seqlen_qo=max_qo_len,
+                uni_seqlen_qo=uni_qo_len,
                 fast_mode=True,
+                max_split_per_batch=self._max_split_per_batch(num_kernel_reqs),
+                dtype_q=self._mla_metadata_q_dtype,
+                dtype_kv=self._mla_metadata_kv_dtype,
             )
             has_persistent_metadata = True
 
@@ -754,6 +884,7 @@ def _expand_mtp_decode_page_indices_kernel(
     qo_len = tl.load(qo_lens + req_idx)
     seq_len_full = tl.load(seq_lens + req_idx)
     seq_len = seq_len_full - (qo_len - 1 - token_idx)
+    seq_len = tl.where(token_idx < qo_len, seq_len, 0)
 
     row_ptr = block_table + req_idx * block_table_stride
     start_idx = tl.load(cu_num_tokens + flat_row)
@@ -1065,18 +1196,21 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             dtype=attn_metadata.decode.attn_out_dtype,
             device=q.device,
         )
-        if attn_metadata.decode.max_qo_len > 1:
+        if (
+            attn_metadata.decode.max_qo_len > 1
+            and not attn_metadata.decode.has_persistent_metadata
+        ):
             # MTP verification can call the AITER MLA decode kernel with
-            # qlen > 1.  Keep the historical zero-filled output behavior for
-            # that path so any unwritten kernel lanes cannot leak into logits.
+            # qlen > 1. If that path is running without persistent metadata,
+            # preserve the old zero-fill guard so unwritten lanes cannot leak
+            # into logits.
             o.zero_()
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
-        # Build kwargs for mla_decode_fwd. Pass persistent metadata only
-        # when it was successfully computed (qseqlen=1 decode steps).
-        # For multi-token verification steps (spec-dec), the kernel falls
-        # back to computing metadata internally.
+        # Build kwargs for mla_decode_fwd. Native MTP qlen>1 uses this metadata
+        # to supply causal verification boundaries; other paths only pass it
+        # when the builder marked the metadata as valid.
         mla_kwargs = dict(
             q_scale=layer._q_scale,
             kv_scale=layer._k_scale,
