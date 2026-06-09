@@ -85,6 +85,10 @@ def _strip_vllm_request_suffix(request_id: str) -> str:
     return match.group(1) if match is not None else request_id
 
 
+def _ceil_div(numerator: int, denominator: int) -> int:
+    return (numerator + denominator - 1) // denominator
+
+
 try:
     from mori.io import (
         BackendType,
@@ -136,9 +140,7 @@ class MoRIIOConnector(KVConnectorBase_V1):
             + ":"
             + str(self.kv_transfer_config.kv_connector_extra_config["handshake_port"])
         )
-        self.mode = get_moriio_mode(
-            self.kv_transfer_config.kv_connector_extra_config
-        )
+        self.mode = get_moriio_mode(self.kv_transfer_config.kv_connector_extra_config)
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: MoRIIOConnectorScheduler | None = (
                 MoRIIOConnectorScheduler(vllm_config, self.engine_id)
@@ -298,9 +300,7 @@ class MoRIIOConnectorScheduler:
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.block_size = vllm_config.cache_config.block_size
         self.engine_id: EngineId = engine_id
-        self.mode = get_moriio_mode(
-            self.kv_transfer_config.kv_connector_extra_config
-        )
+        self.mode = get_moriio_mode(self.kv_transfer_config.kv_connector_extra_config)
         self.host_ip = get_ip()
         # Multi-node TP: VLLM_MORIIO_NODE_HOSTS holds the ordered list of host
         # IPs in this engine's TP group (rank 0 first). Surfaced to the peer
@@ -472,15 +472,15 @@ class MoRIIOConnectorScheduler:
                         # a full prefix cache hit on the D worker. We need to call
                         # send_notify in _read_blocks to free the memory on the P.
 
-                        # Get local blocks to pull remote KV into. If the
-                        # producer returned a longer remote list, trim the
-                        # remote suffix to match the local allocation. Do not
-                        # replace local ids: they index the decode KV cache.
-                        local_block_ids = blocks.get_block_ids()[0]
-                        assert len(local_block_ids) <= len(remote_block_ids)
-                        if len(local_block_ids) != len(remote_block_ids):
-                            remote_block_ids = remote_block_ids[-len(local_block_ids) :]
-                            params["remote_block_ids"] = remote_block_ids
+                        local_block_ids, remote_block_ids = (
+                            self._select_read_transfer_blocks(
+                                request,
+                                blocks,
+                                remote_block_ids,
+                                num_external_tokens,
+                            )
+                        )
+                        params["remote_block_ids"] = remote_block_ids
 
                         self._reqs_need_recv[request.request_id] = (
                             request,
@@ -522,6 +522,57 @@ class MoRIIOConnectorScheduler:
             # Only trigger 1 KV transfer per request.
 
             params["do_remote_prefill"] = False
+
+    def _select_read_transfer_blocks(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        remote_block_ids: list[int],
+        num_external_tokens: int,
+    ) -> tuple[list[int], list[int]]:
+        if num_external_tokens <= 0:
+            return [], []
+
+        local_block_ids = blocks.get_block_ids()[0]
+        request_block_count = min(
+            len(local_block_ids),
+            _ceil_div(request.num_tokens, self.block_size),
+        )
+        local_block_ids = local_block_ids[:request_block_count]
+
+        prompt_token_count = len(getattr(request, "prompt_token_ids", None) or [])
+        external_start_token = max(
+            0,
+            prompt_token_count - 1 - num_external_tokens,
+        )
+        external_end_token = external_start_token + num_external_tokens
+        external_start_block = external_start_token // self.block_size
+        external_end_block = _ceil_div(external_end_token, self.block_size)
+        transfer_block_count = external_end_block - external_start_block
+        selected_local_block_ids = local_block_ids[
+            external_start_block:external_end_block
+        ]
+        if len(selected_local_block_ids) != transfer_block_count:
+            raise RuntimeError(
+                "MoRIIO READ external block count "
+                f"{transfer_block_count} exceeds local availability "
+                f"for request {request.request_id}; would transfer "
+                f"{len(selected_local_block_ids)} blocks"
+            )
+        if len(remote_block_ids) == transfer_block_count:
+            selected_remote_block_ids = remote_block_ids
+        elif len(remote_block_ids) >= external_end_block:
+            selected_remote_block_ids = remote_block_ids[
+                external_start_block:external_end_block
+            ]
+        else:
+            raise RuntimeError(
+                "MoRIIO READ external block count "
+                f"{transfer_block_count} exceeds remote availability "
+                f"for request {request.request_id}; remote has "
+                f"{len(remote_block_ids)} blocks"
+            )
+        return selected_local_block_ids, selected_remote_block_ids
 
     def build_connector_meta(
         self,
@@ -768,12 +819,7 @@ class MoRIIOConnectorScheduler:
         )
 
     def has_pending_deferred_sends(self) -> bool:
-        if not self._deferred_send_deadlines:
-            return False
-        now = time.monotonic()
-        return now < self._deferred_send_drain_until or any(
-            now >= deadline for deadline in self._deferred_send_deadlines.values()
-        )
+        return bool(self._deferred_send_deadlines)
 
 
 class MoRIIOConnectorWorker:
@@ -792,9 +838,7 @@ class MoRIIOConnectorWorker:
         self.vllm_config = vllm_config
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.moriio_config = MoRIIOConfig.from_vllm_config(vllm_config)
-        self.mode = get_moriio_mode(
-            self.kv_transfer_config.kv_connector_extra_config
-        )
+        self.mode = get_moriio_mode(self.kv_transfer_config.kv_connector_extra_config)
 
         logger.info("Initializing MoRIIO worker %s", engine_id)
 
@@ -992,9 +1036,7 @@ class MoRIIOConnectorWorker:
         self.request_id_to_transfer_id[request_id] = transfer_id
         external_request_id = _strip_vllm_request_suffix(request_id)
         if external_request_id != request_id:
-            self.request_id_to_transfer_id.setdefault(
-                external_request_id, transfer_id
-            )
+            self.request_id_to_transfer_id.setdefault(external_request_id, transfer_id)
 
     def _forget_transfer_mapping(
         self, transfer_id: TransferId, request_id: ReqId | None = None
@@ -1007,9 +1049,7 @@ class MoRIIOConnectorWorker:
         self.request_id_to_transfer_id.pop(request_id, None)
         external_request_id = _strip_vllm_request_suffix(request_id)
         if external_request_id != request_id:
-            mapped_transfer_id = self.request_id_to_transfer_id.get(
-                external_request_id
-            )
+            mapped_transfer_id = self.request_id_to_transfer_id.get(external_request_id)
             if mapped_transfer_id == transfer_id:
                 self.request_id_to_transfer_id.pop(external_request_id, None)
 
@@ -1652,9 +1692,7 @@ class MoRIIOConnectorWorker:
         else:
             message = str(error)
             code = "setup"
-        invalid_block_ids = self._recving_transfer_local_block_ids.get(
-            req_id, set()
-        )
+        invalid_block_ids = self._recving_transfer_local_block_ids.get(req_id, set())
         if record_invalid_blocks and invalid_block_ids:
             self._invalid_block_ids.put(set(invalid_block_ids))
             self._recving_transfer_local_block_ids[req_id] = set()
@@ -1673,12 +1711,11 @@ class MoRIIOConnectorWorker:
                 self.moriio_wrapper.send_notify(xfer_id, host, port)
             except Exception:
                 logger.exception(
-                    "Failed to send error notification for request %s; "
-                    "will retry",
+                    "Failed to send error notification for request %s; will retry",
                     req_id,
                 )
                 return
-            self.transfer_id_to_request_id.pop(xfer_id, None)
+            self._forget_transfer_mapping(xfer_id)
         else:
             logger.warning(
                 "No READ completion callback address for failed request %s",
@@ -1951,9 +1988,7 @@ class MoRIIOConnectorWorker:
             meta.remote_engine_id,
             req_id,
         )
-        actual_remote_host = self._pick_host_for_dp_rank(
-            meta, int(meta.remote_dp_rank)
-        )
+        actual_remote_host = self._pick_host_for_dp_rank(meta, int(meta.remote_dp_rank))
         self._read_blocks(
             request_id=req_id,
             transfer_id=meta.transfer_id,
@@ -2125,6 +2160,24 @@ class MoRIIOConnectorWorker:
         if self.mode == MoRIIOMode.WRITE:
             return
 
+        notify_port = str(
+            remote_notify_port
+            + get_port_offset(int(remote_dp_rank), self.tp_rank, int(remote_tp_size))
+        )
+        if not local_block_ids and not remote_block_ids:
+            try:
+                self.moriio_wrapper.send_notify(transfer_id, remote_host, notify_port)
+            except Exception:
+                logger.exception(
+                    "MoRIIO READ empty-transfer notify failed for request %s "
+                    "transfer %s",
+                    request_id,
+                    transfer_id,
+                )
+                raise
+            self._forget_transfer_mapping(transfer_id, request_id)
+            return
+
         # Use the prefill DP rank that actually computed the KV (forwarded by
         # the proxy via kv_transfer_params["remote_dp_rank"]). Hardcoding 0
         # leads to reading from remote DP0's MR for blocks that live in
@@ -2180,14 +2233,8 @@ class MoRIIOConnectorWorker:
                 _overflow,
             )
 
-        notify_port = str(
-            remote_notify_port
-            + get_port_offset(int(remote_dp_rank), self.tp_rank, int(remote_tp_size))
-        )
         with self.moriio_wrapper.lock:
-            self._recving_transfer_local_block_ids[request_id] = set(
-                local_block_ids
-            )
+            self._recving_transfer_local_block_ids[request_id] = set(local_block_ids)
             self._recving_transfers_callback_addr[request_id] = (
                 remote_host,
                 notify_port,
@@ -2205,9 +2252,7 @@ class MoRIIOConnectorWorker:
                 )
             except Exception as e:
                 with self.moriio_wrapper.lock:
-                    has_partial_status = bool(
-                        self._recving_transfers.get(request_id)
-                    )
+                    has_partial_status = bool(self._recving_transfers.get(request_id))
                     self._handle_failed_read_transfer_locked(
                         request_id,
                         error=e,

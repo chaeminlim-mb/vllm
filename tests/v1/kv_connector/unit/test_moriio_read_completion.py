@@ -55,6 +55,7 @@ class FakeWrapper:
         self.notifies: list[tuple[str, str, str]] = []
         self.read_error: Exception | None = None
         self.read_results: list[FakeStatus | Exception] = []
+        self.read_calls = 0
         self.notify_error: Exception | None = None
 
     def send_notify(self, transfer_id: str, host: str, port: str) -> None:
@@ -65,6 +66,7 @@ class FakeWrapper:
         self.notifies.append((transfer_id, host, port))
 
     def read_remote_data(self, *_args):
+        self.read_calls += 1
         if self.read_results:
             result = self.read_results.pop(0)
             if isinstance(result, Exception):
@@ -100,6 +102,7 @@ def make_worker() -> MoRIIOConnectorWorker:
     worker._pending_unmapped_done_tids = set()
     worker._unmatched_write_completions = set()
     worker.transfer_id_to_request_id = {}
+    worker.request_id_to_transfer_id = {}
     return worker
 
 
@@ -248,6 +251,7 @@ def test_wait_for_layer_load_failure_marks_local_blocks_invalid() -> None:
     worker._recving_transfers_callback_addr["req0"] = ("host", "1234", "transfer0")
     worker._recving_transfer_local_block_ids["req0"] = {11, 12}
     worker.transfer_id_to_request_id["transfer0"] = "req0"
+    worker.request_id_to_transfer_id["req0"] = "transfer0"
 
     with pytest.raises(RuntimeError, match="request req0, layer layer0"):
         worker.wait_for_layer_load("layer0")
@@ -258,6 +262,7 @@ def test_wait_for_layer_load_failure_marks_local_blocks_invalid() -> None:
     assert "req0" not in worker._recving_transfers_callback_addr
     assert "req0" not in worker._recving_transfer_local_block_ids
     assert "transfer0" not in worker.transfer_id_to_request_id
+    assert "req0" not in worker.request_id_to_transfer_id
 
 
 def test_pop_done_transfers_waits_for_all_layer_statuses() -> None:
@@ -267,6 +272,7 @@ def test_pop_done_transfers_waits_for_all_layer_statuses() -> None:
     worker._recving_transfers_callback_addr["req0"] = ("host", "1234", "transfer0")
     worker._recving_transfer_local_block_ids["req0"] = {11, 12}
     worker.transfer_id_to_request_id["transfer0"] = "req0"
+    worker.request_id_to_transfer_id["req0"] = "transfer0"
 
     assert worker._pop_done_transfers() == set()
     assert worker.moriio_wrapper.notifies == []
@@ -280,6 +286,7 @@ def test_pop_done_transfers_waits_for_all_layer_statuses() -> None:
     assert "req0" not in worker._recving_transfers_callback_addr
     assert "req0" not in worker._recving_transfer_local_block_ids
     assert "transfer0" not in worker.transfer_id_to_request_id
+    assert "req0" not in worker.request_id_to_transfer_id
 
 
 def test_pop_done_transfers_retries_success_notify_failure() -> None:
@@ -288,6 +295,7 @@ def test_pop_done_transfers_retries_success_notify_failure() -> None:
     worker._recving_transfers_callback_addr["req0"] = ("host", "1234", "transfer0")
     worker._recving_transfer_local_block_ids["req0"] = {11, 12}
     worker.transfer_id_to_request_id["transfer0"] = "req0"
+    worker.request_id_to_transfer_id["req0"] = "transfer0"
     worker.moriio_wrapper.notify_error = RuntimeError("notify failed")
 
     assert worker._pop_done_transfers() == set()
@@ -301,6 +309,7 @@ def test_pop_done_transfers_retries_success_notify_failure() -> None:
     assert worker.moriio_wrapper.notifies == [("transfer0", "host", "1234")]
     assert "req0" not in worker._recving_transfers
     assert "transfer0" not in worker.transfer_id_to_request_id
+    assert "req0" not in worker.request_id_to_transfer_id
 
 
 def test_failed_read_marks_local_blocks_invalid() -> None:
@@ -309,6 +318,7 @@ def test_failed_read_marks_local_blocks_invalid() -> None:
     worker._recving_transfers_callback_addr["req0"] = ("host", "1234", "transfer0")
     worker._recving_transfer_local_block_ids["req0"] = {11, 12}
     worker.transfer_id_to_request_id["transfer0"] = "req0"
+    worker.request_id_to_transfer_id["req0"] = "transfer0"
 
     assert worker._pop_done_transfers() == set()
 
@@ -319,6 +329,32 @@ def test_failed_read_marks_local_blocks_invalid() -> None:
     assert "req0" not in worker._recving_transfers_callback_addr
     assert "req0" not in worker._recving_transfer_local_block_ids
     assert "transfer0" not in worker.transfer_id_to_request_id
+    assert "req0" not in worker.request_id_to_transfer_id
+
+
+def test_empty_read_transfer_notifies_without_remote_read() -> None:
+    worker = make_worker()
+    worker.tp_rank = 0
+    worker.transfer_id_to_request_id["transfer0"] = "req0"
+    worker.request_id_to_transfer_id["req0"] = "transfer0"
+
+    worker._read_blocks(
+        local_block_ids=[],
+        remote_block_ids=[],
+        dst_engine_id="remote",
+        request_id="req0",
+        transfer_id="transfer0",
+        remote_host="host",
+        remote_notify_port=1234,
+        remote_dp_rank=0,
+        remote_tp_size=1,
+    )
+
+    assert worker.moriio_wrapper.notifies == [("transfer0", "host", "1234")]
+    assert worker.moriio_wrapper.read_calls == 0
+    assert "transfer0" not in worker.transfer_id_to_request_id
+    assert "req0" not in worker.request_id_to_transfer_id
+    assert "req0" not in worker._recving_transfers_callback_addr
 
 
 def test_read_blocks_partial_setup_exception_marks_local_blocks_invalid() -> None:

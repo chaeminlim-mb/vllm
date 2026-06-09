@@ -268,6 +268,12 @@ async def handle_request(api: str, request: Request):
                 request_number,
                 prefill_instance_endpoint["dp_size"],
             )
+        selected_decode_dp_rank = None
+        if decode_instance_endpoint["dp_size"] > 1:
+            selected_decode_dp_rank = example_round_robin_dp_loader(
+                request_number,
+                decode_instance_endpoint["dp_size"],
+            )
 
         # Embed both zmq_addresses in the request_id so the connector can parse
         # the peer's host/ports from it, similar to P2P-NCCL
@@ -295,9 +301,9 @@ async def handle_request(api: str, request: Request):
             req_data_to_prefill["kv_transfer_params"]["remote_hosts"] = list(
                 decode_hosts
             )
-        if selected_prefill_dp_rank is not None:
+        if selected_decode_dp_rank is not None:
             req_data_to_prefill["kv_transfer_params"]["remote_dp_rank"] = (
-                selected_prefill_dp_rank
+                selected_decode_dp_rank
             )
 
         prefill_request_url = prefill_instance_endpoint["request_address"] + api
@@ -361,7 +367,7 @@ async def handle_request(api: str, request: Request):
                 decode_request_url,
                 req_data,
                 request_id,
-                selected_prefill_dp_rank,
+                selected_decode_dp_rank,
             )
         )
 
@@ -445,12 +451,12 @@ async def _handle_profile_command(cmd):
         timeout=aiohttp.ClientTimeout(total=3600)
     ) as session:
         p_results, d_results = await asyncio.gather(
-            asyncio.gather(*[
-                _post_profile_to_endpoint(session, u, cmd, payload) for u in p_urls
-            ]),
-            asyncio.gather(*[
-                _post_profile_to_endpoint(session, u, cmd, payload) for u in d_urls
-            ]),
+            asyncio.gather(
+                *[_post_profile_to_endpoint(session, u, cmd, payload) for u in p_urls]
+            ),
+            asyncio.gather(
+                *[_post_profile_to_endpoint(session, u, cmd, payload) for u in d_urls]
+            ),
         )
 
     return {

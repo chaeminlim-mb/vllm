@@ -1621,6 +1621,12 @@ class Scheduler(SchedulerInterface):
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
+        elif self.connector is not None:
+            has_pending_deferred_sends = getattr(
+                self.connector, "has_pending_deferred_sends", None
+            )
+            if has_pending_deferred_sends and has_pending_deferred_sends():
+                self._update_from_kv_xfer_finished(KVConnectorOutput())
 
         # collect KV cache events from KV cache manager
         events = self.kv_cache_manager.take_events()
@@ -1968,9 +1974,7 @@ class Scheduler(SchedulerInterface):
         has_pending_deferred_sends = getattr(
             self.connector, "has_pending_deferred_sends", None
         )
-        return bool(
-            has_pending_deferred_sends and has_pending_deferred_sends()
-        )
+        return bool(has_pending_deferred_sends and has_pending_deferred_sends())
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
