@@ -173,6 +173,7 @@ class ExtractHiddenStatesProposer:
         self,
         num_tokens: int,
         use_cudagraphs: bool = True,
+        dp_warmup: bool = False,
     ) -> tuple[CUDAGraphMode, int, torch.Tensor | None]:
         cudagraph_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
             num_tokens,
@@ -185,33 +186,47 @@ class ExtractHiddenStatesProposer:
         # TODO(Flechman): support DBO ubatching
         should_ubatch, num_tokens_across_dp = False, None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
-            should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
-                coordinate_batch_across_dp(
-                    num_tokens_unpadded=num_tokens,
-                    parallel_config=self.vllm_config.parallel_config,
-                    allow_microbatching=False,
-                    num_tokens_padded=num_tokens_padded,
-                    cudagraph_mode=cudagraph_mode.value,
-                )
-            )
-            assert not should_ubatch, (
-                "DBO ubatching not implemented for extract_hidden_states"
-            )
-
-            # Extract DP-synced values
-            if num_tokens_across_dp is not None:
-                dp_rank = self.dp_rank
-                num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
-                # Re-dispatch with DP padding so we have the correct
-                # batch_descriptor
-                cudagraph_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
+            if dp_warmup:
+                # WARMUP ONLY: skip the bracketing CPU gloo all_reduce so the
+                # per-rank-skewed lazy inductor compile of the draft model does
+                # not deadlock the timeout-bound DP coordinate on a cold cache.
+                # Build a local uniform padding tensor identical on every rank
+                # (all warmup callers iterate the same sizes in the same order).
+                dp_size = self.vllm_config.parallel_config.data_parallel_size
+                num_tokens_across_dp = torch.full(
+                    (dp_size,),
                     num_tokens_padded,
-                    valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
+                    dtype=torch.int32,
+                    device="cpu",
                 )
-                # Assert to make sure the agreed upon token count is correct
-                # otherwise num_tokens_across_dp will no-longer be valid
-                assert batch_desc.num_tokens == num_tokens_padded
-                num_tokens_across_dp[dp_rank] = num_tokens_padded
+            else:
+                should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
+                    coordinate_batch_across_dp(
+                        num_tokens_unpadded=num_tokens,
+                        parallel_config=self.vllm_config.parallel_config,
+                        allow_microbatching=False,
+                        num_tokens_padded=num_tokens_padded,
+                        cudagraph_mode=cudagraph_mode.value,
+                    )
+                )
+                assert not should_ubatch, (
+                    "DBO ubatching not implemented for extract_hidden_states"
+                )
+
+                # Extract DP-synced values
+                if num_tokens_across_dp is not None:
+                    dp_rank = self.dp_rank
+                    num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
+                    # Re-dispatch with DP padding so we have the correct
+                    # batch_descriptor
+                    cudagraph_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
+                        num_tokens_padded,
+                        valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
+                    )
+                    # Assert to make sure the agreed upon token count is correct
+                    # otherwise num_tokens_across_dp will no-longer be valid
+                    assert batch_desc.num_tokens == num_tokens_padded
+                    num_tokens_across_dp[dp_rank] = num_tokens_padded
 
         return cudagraph_mode, num_tokens_padded, num_tokens_across_dp
 
@@ -240,11 +255,12 @@ class ExtractHiddenStatesProposer:
         use_cudagraphs: bool = True,
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,
+        dp_warmup: bool = False,
     ) -> None:
         assert self.model is not None, "Model must be initialized before dummy_run"
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(
-                num_tokens, use_cudagraphs=use_cudagraphs
+                num_tokens, use_cudagraphs=use_cudagraphs, dp_warmup=dp_warmup
             )
         )
 

@@ -574,6 +574,26 @@ class ParallelConfig:
             stateless_init_torch_distributed_process_group,
         )
 
+        # Bound the blast radius of the DP gloo coordination group (wideEP DP
+        # all_reduce wedge). This gloo CPU group otherwise inherits torch's
+        # 1800s default collective timeout, so one rank stalling on the
+        # per-step path before dp_utils._run_ar's all_reduce turns into an
+        # instance-wide 30-minute deadlock. VLLM_DP_COLLECTIVE_TIMEOUT_S is
+        # UNSET by default (-> keep the 1800s behaviour); if set (e.g. 180),
+        # the DP group fails fast instead of hanging. Only the DP gloo group is
+        # affected here; other (non-DP) groups keep their existing behaviour.
+        dp_timeout = None
+        _dp_timeout_raw = os.environ.get("VLLM_DP_COLLECTIVE_TIMEOUT_S")
+        if _dp_timeout_raw:
+            from datetime import timedelta
+
+            try:
+                _dp_timeout_s = float(_dp_timeout_raw)
+            except ValueError:
+                _dp_timeout_s = 0.0
+            if _dp_timeout_s > 0:
+                dp_timeout = timedelta(seconds=_dp_timeout_s)
+
         max_retries = 5
         last_exc: Exception | None = None
         for _ in range(max_retries):
@@ -588,6 +608,7 @@ class ParallelConfig:
                     backend="gloo",
                     return_store=return_store,
                     listen_socket=listen_socket,
+                    timeout=dp_timeout,
                 )
             except DistNetworkError as e:
                 # We only want to retry when the root cause is EADDRINUSE.

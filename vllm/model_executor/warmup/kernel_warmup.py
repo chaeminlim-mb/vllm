@@ -53,6 +53,16 @@ def _resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
 
 
 def kernel_warmup(worker: "Worker"):
+    # AITER rms_norm JIT pre-build (WEDGE #2): force the AITER rms_norm JIT
+    # modules (module_rmsnorm / module_rmsnorm_quant) to build here, in the
+    # v4-gated warmup phase, so no AITER kernel builds on the per-step serving
+    # path (where a same-node file_baton serialize would deadlock peers blocked
+    # in the per-step DP all_reduce). No-op for dp_size==1 / non-rocm /
+    # non-aiter / already-warm AITER cache.
+    from vllm.model_executor.warmup.aiter_warmup import aiter_rmsnorm_warmup
+
+    aiter_rmsnorm_warmup(worker.vllm_config)
+
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
         envs.VLLM_USE_DEEP_GEMM

@@ -324,6 +324,7 @@ class GroupCoordinator:
         use_device_communicator: bool,  # whether to use device communicator
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
+        timeout=None,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -335,14 +336,21 @@ class GroupCoordinator:
         self_device_group = None
         self_cpu_group = None
 
+        # wideEP DP all_reduce wedge backstop: when a bounded timeout is given
+        # (DP coordination group only — see init at group_name="dp"), pass it to
+        # both the device and gloo groups so a stalled rank fails fast instead of
+        # hanging on torch's 1800s gloo default. timeout=None -> default behavior.
+        _ng_timeout_kwargs = {} if timeout is None else {"timeout": timeout}
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
+                ranks, backend=torch_distributed_backend, **_ng_timeout_kwargs
             )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             with suppress_stdout():
-                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                cpu_group = torch.distributed.new_group(
+                    ranks, backend="gloo", **_ng_timeout_kwargs
+                )
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
@@ -1163,6 +1171,7 @@ def init_model_parallel_group(
     use_message_queue_broadcaster: bool = False,
     group_name: str | None = None,
     use_device_communicator: bool = True,
+    timeout=None,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=group_ranks,
@@ -1171,6 +1180,7 @@ def init_model_parallel_group(
         use_device_communicator=use_device_communicator,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
+        timeout=timeout,
     )
 
 
@@ -1663,8 +1673,30 @@ def initialize_model_parallel(
             coord_store=coord_store,
         )
     else:
+        # wideEP DP all_reduce wedge backstop: bound the DP coordination group's
+        # gloo collective timeout. The per-step DP all_reduce (vllm/v1/worker/
+        # dp_utils.py _run_ar) runs on THIS group's cpu_group; without a bound,
+        # one rank stalling (e.g. in a non-uniform draft-model compile) hangs all
+        # ranks for torch's 1800s default. Scoped to the DP group only — TP/PP/EP
+        # are created without timeout and keep their existing behavior.
+        # VLLM_DP_COLLECTIVE_TIMEOUT_S unset -> None -> default preserved.
+        import os as _os
+
+        _dp_timeout = None
+        _dp_to_raw = _os.environ.get("VLLM_DP_COLLECTIVE_TIMEOUT_S")
+        if _dp_to_raw:
+            try:
+                _dp_to_s = float(_dp_to_raw)
+            except ValueError:
+                _dp_to_s = 0.0
+            if _dp_to_s > 0:
+                _dp_timeout = timedelta(seconds=_dp_to_s)
         _DP = init_model_parallel_group(
-            group_ranks, get_world_group().local_rank, backend, group_name="dp"
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="dp",
+            timeout=_dp_timeout,
         )
 
     global _EP

@@ -197,6 +197,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         use_cudagraphs: bool = True,
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,
+        dp_warmup: bool = False,
     ) -> None:
         """
         Key differences to default dummy_run:
@@ -209,7 +210,9 @@ class DFlashProposer(SpecDecodeBaseProposer):
         num_query_tokens = min(num_tokens, self.max_query_tokens)
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(
-                num_query_tokens, use_cudagraphs=use_cudagraphs
+                num_query_tokens,
+                use_cudagraphs=use_cudagraphs,
+                dp_warmup=dp_warmup,
             )
         )
 

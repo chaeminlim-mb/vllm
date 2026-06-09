@@ -530,6 +530,7 @@ def stateless_init_torch_distributed_process_group(
     group_name: str | None = None,
     return_store: bool = False,
     listen_socket: socket.socket | None = None,
+    timeout: timedelta | None = None,
 ) -> ProcessGroup | tuple[ProcessGroup, Store]:
     """
     A replacement for `torch.distributed.init_process_group` that does not
@@ -566,10 +567,18 @@ def stateless_init_torch_distributed_process_group(
     is skipped and a ``TCPStore`` server is created directly using the
     pre-bound socket.  This is useful for eliminating TOCTOU races
     between port allocation and binding.
+
+    When *timeout* is provided, it overrides the backend default collective
+    timeout for both the store and the process group. This is used to bound
+    the blast radius of the DP gloo coordination group (wideEP DP all_reduce
+    wedge): without it, the gloo group inherits torch's 1800s default, so one
+    rank's per-step stall becomes an instance-wide 30-minute all_reduce
+    deadlock. When unset, the 1800s default behaviour is preserved.
     """
     init_method = get_tcp_uri(host, port)
     backend = Backend(backend)  # it is basically string
-    timeout = _get_default_timeout(backend)
+    if timeout is None:
+        timeout = _get_default_timeout(backend)
 
     if listen_socket is not None:
         store = create_tcp_store(

@@ -195,6 +195,19 @@ from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_total_cp_world_size,
 )
+try:
+    # Optional diagnostic for the wideEP DP all_reduce wedge. Imported
+    # defensively: this module is delivered via a runtime bind-mount overlay,
+    # which is gated independently of the gpu_model_runner.py overlay, so a
+    # divergent overlay must degrade to an inert no-op instead of crashing the
+    # worker at import time.
+    from vllm.v1.worker.dp_step_watchdog import heartbeat as _dp_step_heartbeat
+except Exception:  # pragma: no cover - diagnostic module is optional
+
+    def _dp_step_heartbeat() -> None:
+        return None
+
+
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
@@ -3751,6 +3764,13 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        # WARMUP-ONLY (set by the profile/compile/capture _dummy_run callers,
+        # never by serving execute_dummy_batch / the external-launcher dummy):
+        # when True with dp_size>1, build a local uniform num_tokens_across_dp
+        # instead of running the bracketing CPU gloo all_reduce, so the
+        # per-rank-skewed cold main-model inductor compile cannot deadlock the
+        # timeout-bound DP coordinate. Mirrors the drafter gating.
+        dp_warmup: bool = False,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3809,29 +3829,53 @@ class GPUModelRunner(
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
-            should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
-                coordinate_batch_across_dp(
-                    num_tokens_unpadded=num_tokens,
-                    parallel_config=self.parallel_config,
-                    allow_microbatching=allow_microbatching,
-                    num_tokens_padded=num_tokens_padded,
-                    uniform_decode=uniform_decode,
-                    cudagraph_mode=cudagraph_mode.value,
-                )
-            )
-
-            # Extract DP-synced values
-            if num_tokens_across_dp is not None:
-                dp_rank = self.parallel_config.data_parallel_rank
-                num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
-                # Re-dispatch with DP padding so we have the correct batch_descriptor
-                cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+            if dp_warmup:
+                # WARMUP ONLY (compile/capture/profile callers, never the
+                # per-step serving execute_dummy_batch->_dummy_run path or the
+                # external-launcher dummy): skip the bracketing CPU gloo
+                # all_reduce so the per-rank-skewed cold inductor compile of the
+                # main DeepseekV2Model does not deadlock the DP coordinate (the
+                # all_reduce is timeout-bound; non-uniform compile wall-time
+                # blows that budget on a cold cache). Build a local uniform
+                # padding tensor that is identical on every rank: all warmup
+                # callers drive the same warmup/capture/profile sizes in the
+                # same order on every rank, so this matches what the all_reduce
+                # would have produced without a timeout-bound collective during
+                # the skewed compile. A payload-free DP barrier in
+                # compile_or_warm_up_model re-aligns ranks before the first
+                # serving coordinate all_reduce.
+                dp_size = self.vllm_config.parallel_config.data_parallel_size
+                num_tokens_across_dp = torch.full(
+                    (dp_size,),
                     num_tokens_padded,
-                    valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
+                    dtype=torch.int32,
+                    device="cpu",
                 )
-                # Assert to make sure the agreed upon token count is correct otherwise
-                # num_tokens_across_dp will no-longer be valid
-                assert batch_descriptor.num_tokens == num_tokens_padded
+            else:
+                should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
+                    coordinate_batch_across_dp(
+                        num_tokens_unpadded=num_tokens,
+                        parallel_config=self.parallel_config,
+                        allow_microbatching=allow_microbatching,
+                        num_tokens_padded=num_tokens_padded,
+                        uniform_decode=uniform_decode,
+                        cudagraph_mode=cudagraph_mode.value,
+                    )
+                )
+
+                # Extract DP-synced values
+                if num_tokens_across_dp is not None:
+                    dp_rank = self.parallel_config.data_parallel_rank
+                    num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
+                    # Re-dispatch with DP padding so we have the correct
+                    # batch_descriptor
+                    cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                        num_tokens_padded,
+                        valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
+                    )
+                    # Assert to make sure the agreed upon token count is correct
+                    # otherwise num_tokens_across_dp will no-longer be valid
+                    assert batch_descriptor.num_tokens == num_tokens_padded
 
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
@@ -3975,6 +4019,12 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        # Per-step watchdog heartbeat (wideEP DP all_reduce wedge diagnostic):
+        # update progress at the tightest per-step point that every DP rank
+        # passes, so a rank stalling *before* the DP coordination all_reduce in
+        # dp_utils._run_ar gets its stack captured. No-op unless
+        # VLLM_DP_STEP_WATCHDOG_S is set.
+        _dp_step_heartbeat()
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -5542,6 +5592,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        dp_warmup: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5569,7 +5620,20 @@ class GPUModelRunner(
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
+            dp_warmup: If True (set only by compile/capture/profile warmup
+                callers, never by the per-step serving execute_dummy_batch
+                path or the external-launcher dummy), both the main-model and
+                the drafter coordinate their DP batch padding locally instead
+                of via the bracketing CPU gloo all_reduce. This keeps the
+                per-rank-skewed cold-cache compile (main DeepseekV2Model first,
+                then the drafter) from deadlocking the timeout-bound DP
+                coordinate. Serving keeps the real coordinate_batch_across_dp.
         """
+        # Per-step watchdog heartbeat (wideEP DP all_reduce wedge diagnostic):
+        # idle DP ranks reach coordinate_batch_across_dp via _dummy_run, so we
+        # must beat here too to detect a rank stalling before _run_ar's
+        # all_reduce. No-op unless VLLM_DP_STEP_WATCHDOG_S is set.
+        _dp_step_heartbeat()
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
             # The current dummy run only covers LM execution, so we can skip it.
@@ -5654,6 +5718,11 @@ class GPUModelRunner(
                 # `force_num_active_loras` is used for cudagraph capture; because we
                 # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
+                # WARMUP-ONLY: when set by the profile/compile/capture callers
+                # (never serving), gate the main-model DP coordinate to a local
+                # uniform tensor so the skewed cold compile cannot deadlock the
+                # bracketing gloo all_reduce. Serving callers leave this False.
+                dp_warmup=dp_warmup,
             )
         )
 
@@ -5870,6 +5939,7 @@ class GPUModelRunner(
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
                     slot_mappings=slot_mappings,
+                    dp_warmup=dp_warmup,
                 )
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
@@ -6155,7 +6225,7 @@ class GPUModelRunner(
 
         # Add `is_profile` here to pre-allocate communication buffers
         hidden_states, last_hidden_states = self._dummy_run(
-            self.max_num_tokens, is_profile=True
+            self.max_num_tokens, is_profile=True, dp_warmup=True
         )
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
@@ -6501,6 +6571,7 @@ class GPUModelRunner(
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
+                dp_warmup=True,
             )
         with profiler:
             with torch.profiler.record_function(
@@ -6516,6 +6587,7 @@ class GPUModelRunner(
                     num_active_loras=desc.num_active_loras,
                     is_graph_capturing=True,
                     profile_seq_lens=profile_seq_lens,
+                    dp_warmup=True,
                 )
 
     def _capture_cudagraphs(

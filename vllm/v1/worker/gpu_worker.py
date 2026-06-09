@@ -33,6 +33,7 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.parallel_state import (
     Handle,
+    get_dp_group,
     get_pp_group,
     get_tp_group,
 )
@@ -600,7 +601,9 @@ class Worker(WorkerBase):
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
+            self.model_runner._dummy_run(
+                size, skip_eplb=True, remove_lora=False, dp_warmup=True
+            )
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
         # Warmup and tune the kernels used during model execution before
@@ -703,6 +706,7 @@ class Worker(WorkerBase):
                 num_tokens=max_num_reqs,
                 skip_eplb=True,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                dp_warmup=True,
             )
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
@@ -720,6 +724,21 @@ class Worker(WorkerBase):
         )
 
         activate_triton_jit_monitor()
+
+        if (
+            self.vllm_config.parallel_config.data_parallel_size > 1
+            and self.vllm_config.speculative_config is not None
+        ):
+            # The draft inductor artifact was materialized during this warmup
+            # phase with the bracketing DP all_reduce skipped (dp_warmup), so
+            # the per-rank-skewed cold-cache compile could not deadlock the
+            # timeout-bound DP coordinate. Per-rank compile wall-time is still
+            # highly skewed; absorb that skew here with a payload-free CPU gloo
+            # barrier (NOT the 1800s-bound _run_ar all_reduce) so the FIRST
+            # serving coordinate all_reduce starts with all ranks aligned.
+            # Guarded for DP + spec-decode: a no-op for dp_size==1 and for
+            # non-spec-decode runs.
+            get_dp_group().barrier()
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
