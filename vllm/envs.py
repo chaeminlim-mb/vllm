@@ -215,6 +215,7 @@ if TYPE_CHECKING:
     VLLM_MORIIO_QP_PER_TRANSFER: int = 1
     VLLM_MORIIO_POST_BATCH_SIZE: int = -1
     VLLM_MORIIO_NUM_WORKERS: int = 1
+    VLLM_DP_SYNC_KV_CACHE_NUM_BLOCKS: bool = True
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
@@ -1538,6 +1539,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Controls the number of workers for Mori operations for the Mori-IO connector
     "VLLM_MORIIO_NUM_WORKERS": lambda: int(os.getenv("VLLM_MORIIO_NUM_WORKERS", "1")),
+    # When data-parallel-size > 1, min-reduce the profiled KV-cache memory
+    # across DP replicas so every DP rank derives an identical num_gpu_blocks.
+    # Independent per-rank memory profiling otherwise drifts num_gpu_blocks by
+    # a few thousand blocks, which makes MoRIIO PD cross-instance KV reads
+    # overflow the smaller memory region at high concurrency. Set to 0 to
+    # restore the legacy per-rank-independent behavior.
+    "VLLM_DP_SYNC_KV_CACHE_NUM_BLOCKS": lambda: bool(
+        int(os.getenv("VLLM_DP_SYNC_KV_CACHE_NUM_BLOCKS", "1"))
+    ),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
         os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")
