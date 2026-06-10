@@ -615,9 +615,14 @@ class MessageQueue:
             self.started = time.monotonic()
             self.deadline = sys.maxsize if timeout is None else self.started + timeout
 
-            # if should_warn, we need to wake up periodically to log
-            self.warning_wait_time_ms: int | None = (
-                VLLM_RINGBUFFER_WARNING_INTERVAL * 1000 if should_warn else None
+            # Never park indefinitely: the notify ping channel is best-effort
+            # by design (PUB SNDHWM=1 drops silently, SUB is CONFLATE), so a
+            # parked reader must periodically recheck the authoritative SHM
+            # written-flag or one lost ping wedges the whole DP group.
+            # Warning readers keep the 60s warn cadence; indefinite readers
+            # recheck every 5s (idle-only cost, ~0.2 wakeups/s).
+            self.warning_wait_time_ms: int = (
+                VLLM_RINGBUFFER_WARNING_INTERVAL * 1000 if should_warn else 5000
             )
 
             self._should_warn = should_warn
