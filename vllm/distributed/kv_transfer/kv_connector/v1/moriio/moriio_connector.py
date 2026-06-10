@@ -2011,12 +2011,58 @@ class MoRIIOConnectorWorker:
 
         self._reqs_to_send.update(metadata.reqs_to_send)
 
+    def _ensure_remote_dp_handshaked(self, meta: ReqMeta) -> None:
+        """Build-on-demand handshake for the prefill DP rank THIS request reads
+        from.
+
+        With heterogeneous parallelism (e.g. DP-prefill <-> TP-decode) a request
+        can target any remote DP rank, but the first-contact all-to-all
+        handshake only fires once and has no retry: a rank whose prefill
+        handshake listener wasn't up yet (or that was simply never contacted) is
+        left with no entry in layer_name_to_remote_kv_cache_metadata. Reading
+        from it then KeyErrors in _get_built_session and kills the EngineCore.
+
+        Handshake the needed rank synchronously on first use here. Cost is one
+        MoRIIO metadata exchange (~1-4ms measured), one-time per rank — the
+        result is cached in layer_name_to_remote_kv_cache_metadata /
+        built_write_session and reused thereafter. No-op once handshaked, so
+        the symmetric / already-warmed path is unaffected.
+        """
+        base_engine_id = (
+            str(meta.remote_host) + ":" + str(meta.remote_handshake_port)
+        )
+        dp_rank = int(meta.remote_dp_rank)
+        dp_engine_id = self.get_engine_name_with_dp(base_engine_id, dp_rank)
+        if dp_engine_id in self.layer_name_to_remote_kv_cache_metadata:
+            return
+        with self._handshake_lock:
+            # Re-check under the lock — another worker step may have just
+            # handshaked this rank.
+            if dp_engine_id in self.layer_name_to_remote_kv_cache_metadata:
+                return
+            host = self._pick_host_for_dp_rank(meta, dp_rank)
+            logger.info(
+                "MoRIIO build-on-demand handshake for remote dp rank %d (%s)",
+                dp_rank,
+                dp_engine_id,
+            )
+            self._remote_agents[dp_engine_id] = self._moriio_handshake(
+                host,
+                int(meta.remote_handshake_port),
+                int(meta.tp_size),
+                dp_engine_id,
+                dp_rank,
+            )
+
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         logger.debug(
             "Remote agent %s available, calling _read_blocks for req %s",
             meta.remote_engine_id,
             req_id,
         )
+        # Build-on-demand: guarantee this request's remote prefill DP rank is
+        # handshaked before any read (heterogeneous DP-prefill <-> TP-decode).
+        self._ensure_remote_dp_handshaked(meta)
         actual_remote_host = self._pick_host_for_dp_rank(
             meta, int(meta.remote_dp_rank)
         )

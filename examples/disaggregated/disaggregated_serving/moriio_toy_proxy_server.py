@@ -269,6 +269,19 @@ async def handle_request(api: str, request: Request):
                 prefill_instance_endpoint["dp_size"],
             )
 
+        # Decode routes to its OWN dp rank, derived from the DECODE's dp_size —
+        # not the prefill's. With heterogeneous parallelism (e.g. DP8EP prefill +
+        # TP8 decode, dp_size=1), forwarding the prefill rank yields
+        # "data_parallel_rank N out of range [0,1)" -> 400 on the decode. For
+        # uniform DP8<->DP8 this matches the prefill rank (same loader/args), so
+        # behavior is unchanged there.
+        selected_decode_dp_rank = None
+        if decode_instance_endpoint["dp_size"] > 1:
+            selected_decode_dp_rank = example_round_robin_dp_loader(
+                request_number,
+                decode_instance_endpoint["dp_size"],
+            )
+
         # Embed both zmq_addresses in the request_id so the connector can parse
         # the peer's host/ports from it, similar to P2P-NCCL
         uid = str(uuid.uuid4()).replace("-", "")
@@ -368,7 +381,7 @@ async def handle_request(api: str, request: Request):
                 decode_request_url,
                 req_data,
                 request_id,
-                selected_prefill_dp_rank,
+                selected_decode_dp_rank,
             )
         )
 
