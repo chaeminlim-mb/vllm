@@ -201,6 +201,7 @@ class MoRIIOConfig:
     tp_size: int
     transfer_timeout: float
     defer_timeout: float
+    handshake_timeout: float
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> "MoRIIOConfig":
@@ -247,6 +248,11 @@ class MoRIIOConfig:
             defer_timeout=float(
                 extra_config.get("defer_timeout", MoRIIOConstants.DEFAULT_DEFER_TIMEOUT)
             ),
+            handshake_timeout=float(
+                extra_config.get(
+                    "handshake_timeout", MoRIIOConstants.DEFAULT_HANDSHAKE_TIMEOUT
+                )
+            ),
         )
 
 
@@ -274,6 +280,14 @@ class MoRIIOConstants:
     # notification is reaped and its blocks force-freed.
     # Overridable via kv_connector_extra_config["defer_timeout"].
     DEFAULT_DEFER_TIMEOUT = 60.0
+    # Timeout (seconds) for a single MoRIIO handshake metadata exchange. Bounds
+    # a dead/slow remote handshake listener so a missing prefill rank fails fast
+    # (HandshakeError) instead of blocking a TP worker forever on recv() and
+    # desyncing the TP collective. The eager all-rank handshake runs at first
+    # request (post health-gate), so the remote listener is already up and
+    # answers in ~ms; this is a safety net for genuine mid-run faults.
+    # Overridable via kv_connector_extra_config["handshake_timeout"].
+    DEFAULT_HANDSHAKE_TIMEOUT = 10.0
 
 
 # The router embeds both zmq_addresses in the request_id (similar to P2pNcclConnector):
