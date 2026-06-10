@@ -661,9 +661,20 @@ class MoRIIOWrapper:
 
         if path not in self.paths:
             ctx = zmq.Context.instance()
-            sock = make_zmq_socket(
-                ctx=ctx, path=path, socket_type=zmq.DEALER, bind=False
-            )
+            sock = ctx.socket(zmq.DEALER)
+            # Notify rides a long-lived mgmt-rail TCP stream with sparse
+            # traffic. A silently dead peer (no FIN/RST) otherwise stalls
+            # delivery for the kernel retransmit ladder (~5 min observed:
+            # c77 14:25:47-14:30:54Z) while prefill serializes 30s handshake
+            # polls behind it. Keepalive (idle 30s, 3x10s probes) caps the
+            # stall: zmq drops the dead connection, reconnects and resends.
+            sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 10)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
+            sock.setsockopt(zmq.SNDHWM, 0)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.connect(path)
             self.paths[path] = sock
 
         req_list = req_ids if isinstance(req_ids, list) else [req_ids]

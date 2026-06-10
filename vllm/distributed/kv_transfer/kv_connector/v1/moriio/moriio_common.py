@@ -462,9 +462,17 @@ def zmq_ctx(socket_type: Any, addr: str) -> Iterator[zmq.Socket]:
     ctx: zmq.Context | None = None
     try:
         ctx = zmq.Context()  # type: ignore[attr-defined]
-        yield make_zmq_socket(
+        sock = make_zmq_socket(
             ctx=ctx, path=addr, socket_type=socket_type, bind=socket_type == zmq.ROUTER
         )
+        # Mgmt-rail notify/handshake streams are sparse; a silently dead
+        # peer otherwise wedges them for the TCP retransmit ladder (~5 min,
+        # c77 incident). Keepalive applies to accepted connections too.
+        sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
+        sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
+        sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 10)
+        sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
+        yield sock
     finally:
         if ctx is not None:
             ctx.destroy(linger=0)
