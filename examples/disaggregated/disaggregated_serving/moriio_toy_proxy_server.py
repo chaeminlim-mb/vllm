@@ -211,7 +211,19 @@ async def stream_decode_response(session, response, request_id):
 
 
 def example_round_robin_dp_loader(request_number, dp_size):
-    return request_nums % dp_size
+    return (request_number - 1) % dp_size
+
+
+def example_prefill_request_number(request_number, num_prefill_instances):
+    return ((request_number - 1) // num_prefill_instances) + 1
+
+
+@app.route("/health", methods=["GET"])
+async def health():
+    # Benchmark harnesses and load balancers often probe the proxy URL and
+    # treat a non-200 response as a dead service. Backends expose /health, but
+    # this proxy used to lack one; report the proxy process itself as healthy.
+    return ("ok", 200)
 
 
 @app.route("/v1/completions", methods=["POST"])
@@ -229,6 +241,7 @@ async def handle_request(api: str, request: Request):
         with _list_lock:
             global request_nums
             request_nums += 1
+            request_number = request_nums
 
         req_data = await request.get_json()
 
@@ -244,15 +257,15 @@ async def handle_request(api: str, request: Request):
                     503,
                 )
             )
-        pid = request_nums % len(prefill_instances)
-        did = request_nums % len(decode_instances)
+        pid = (request_number - 1) % len(prefill_instances)
+        did = (request_number - 1) % len(decode_instances)
         prefill_instance_endpoint = prefill_instances[pid]
         decode_instance_endpoint = decode_instances[did]
 
         selected_prefill_dp_rank = None
         if prefill_instance_endpoint["dp_size"] > 1:
             selected_prefill_dp_rank = example_round_robin_dp_loader(
-                request_nums // len(prefill_instance_endpoint),
+                example_prefill_request_number(request_number, len(prefill_instances)),
                 prefill_instance_endpoint["dp_size"],
             )
 
@@ -288,7 +301,17 @@ async def handle_request(api: str, request: Request):
             )
         )
 
-        req_data["max_tokens"] -= 1
+        # Match each OpenAI endpoint's token budget semantics: chat prefers
+        # max_completion_tokens only when it is not null, then falls back to
+        # max_tokens; completions ignores max_completion_tokens and enforces
+        # max_tokens.
+        if api == "/chat/completions":
+            if req_data.get("max_completion_tokens") is not None:
+                req_data["max_completion_tokens"] -= 1
+            elif req_data.get("max_tokens") is not None:
+                req_data["max_tokens"] -= 1
+        elif api == "/completions" and req_data.get("max_tokens") is not None:
+            req_data["max_tokens"] -= 1
 
         req_data["kv_transfer_params"] = {
             "do_remote_decode": False,
