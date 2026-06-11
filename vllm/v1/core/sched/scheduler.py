@@ -67,6 +67,13 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # Class-level defaults so partially constructed schedulers (upstream
+    # unit tests build instances via object.__new__) take the disabled
+    # path in _update_request_with_output without AttributeError.
+    relaxed_thinking: bool = False
+    think_start_token_id: int | None = None
+    think_end_token_id: int | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,

@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.config import KVTransferConfig
-
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
+    ROLE,
     MoRIIOConfig,
     MoRIIOMode,
     ReqMeta,
@@ -17,9 +17,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     get_port_offset,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
+    _MAX_PENDING_UNMAPPED_DONE_TIDS,
     MoRIIOConnector,
     MoRIIOConnectorWorker,
 )
+
+
+@pytest.fixture
+def should_do_global_cleanup_after_test() -> bool:
+    return False
 
 
 class FakeStatus:
@@ -66,6 +72,12 @@ class FakeWrapper:
             raise error
         self.notifies.append((transfer_id, host, port))
 
+    def async_wait_reqid(self) -> None:
+        pass
+
+    def pop_finished_req_ids(self) -> set[str]:
+        return set()
+
     def read_remote_data(self, *_args):
         if self.read_results:
             result = self.read_results.pop(0)
@@ -99,11 +111,130 @@ def make_worker() -> MoRIIOConnectorWorker:
     worker._recving_transfer_local_block_ids = {}
     worker._invalid_block_ids = queue.Queue()
     worker._reqs_to_send = {}
-    worker._pending_unmapped_done_tids = set()
+    worker._pending_unmapped_done_tids = {}
     worker._unmatched_write_completions = set()
     worker.transfer_id_to_request_id = {}
     worker.request_id_to_transfer_id = {}
     return worker
+
+
+def test_connector_wait_for_layer_load_forwards_only_for_read_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.distributed.kv_transfer.kv_connector.v1.moriio import (
+        moriio_connector as connector_module,
+    )
+
+    connector = object.__new__(MoRIIOConnector)
+    calls: list[str] = []
+    connector.connector_worker = SimpleNamespace(
+        wait_for_layer_load=lambda layer_name: calls.append(layer_name)
+    )
+
+    connector.mode = MoRIIOMode.READ
+    monkeypatch.setattr(connector_module, "get_role", lambda: ROLE.CONSUMER)
+    connector.wait_for_layer_load("layer0")
+    assert calls == ["layer0"]
+
+    connector.mode = MoRIIOMode.WRITE
+    connector.wait_for_layer_load("layer1")
+    assert calls == ["layer0"]
+
+
+def test_pending_unmapped_done_tids_evicts_oldest_at_cap() -> None:
+    worker = make_worker()
+
+    for idx in range(_MAX_PENDING_UNMAPPED_DONE_TIDS):
+        worker._buffer_pending_unmapped_done_tid(f"missing-{idx}")
+
+    worker._buffer_pending_unmapped_done_tid("new")
+
+    assert len(worker._pending_unmapped_done_tids) == (_MAX_PENDING_UNMAPPED_DONE_TIDS)
+    assert "missing-0" not in worker._pending_unmapped_done_tids
+    assert "missing-1" in worker._pending_unmapped_done_tids
+    assert "new" in worker._pending_unmapped_done_tids
+
+
+def test_freed_transfer_ids_drop_pending_unmapped_done_tids() -> None:
+    worker = make_worker()
+    worker.is_producer = True
+    transfer_id = "tx-00000000-0000-0000-0000-000000000001"
+    request_id = "req0-deadbeef"
+    wrapped_transfer_id = f"wrapped-{transfer_id}-suffix"
+    worker.transfer_id_to_request_id[transfer_id] = request_id
+    worker.request_id_to_transfer_id[request_id] = transfer_id
+    worker._pending_unmapped_done_tids = {
+        transfer_id: None,
+        wrapped_transfer_id: None,
+        request_id: None,
+        "other": None,
+    }
+    metadata = SimpleNamespace(
+        freed_transfer_ids={transfer_id},
+        transfer_id_to_request_id={},
+    )
+
+    worker.start_load_kv(metadata)
+
+    assert transfer_id not in worker._pending_unmapped_done_tids
+    assert wrapped_transfer_id not in worker._pending_unmapped_done_tids
+    assert request_id not in worker._pending_unmapped_done_tids
+    assert "other" in worker._pending_unmapped_done_tids
+    assert transfer_id not in worker.transfer_id_to_request_id
+
+
+def test_zmq_ctx_sets_keepalive_before_bind_and_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.distributed.kv_transfer.kv_connector.v1.moriio import (
+        moriio_common as common,
+    )
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object, object | None]] = []
+
+        def setsockopt(self, option: object, value: object) -> None:
+            self.events.append(("setsockopt", option, value))
+
+        def bind(self, path: str) -> None:
+            self.events.append(("bind", path, None))
+
+        def connect(self, path: str) -> None:
+            self.events.append(("connect", path, None))
+
+    sockets: list[FakeSocket] = []
+
+    class FakeContext:
+        def socket(self, _socket_type: object) -> FakeSocket:
+            sock = FakeSocket()
+            sockets.append(sock)
+            return sock
+
+        def destroy(self, linger: int = 0) -> None:
+            pass
+
+    monkeypatch.setattr(common.zmq, "Context", FakeContext)
+    monkeypatch.setattr(
+        common.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(total=64 * 1024**3, available=32 * 1024**3),
+    )
+
+    with common.zmq_ctx(common.zmq.ROUTER, "tcp://127.0.0.1:5555"):
+        pass
+    router_events = sockets[-1].events
+    keepalive = ("setsockopt", common.zmq.TCP_KEEPALIVE, 1)
+    assert router_events.index(keepalive) < router_events.index(
+        ("bind", "tcp://127.0.0.1:5555", None)
+    )
+
+    with common.zmq_ctx(common.zmq.DEALER, "tcp://127.0.0.1:5555"):
+        pass
+    dealer_events = sockets[-1].events
+    assert dealer_events.index(keepalive) < dealer_events.index(
+        ("connect", "tcp://127.0.0.1:5555", None)
+    )
 
 
 def test_finished_count_tracks_tensor_parallel_size() -> None:

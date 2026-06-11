@@ -12,7 +12,6 @@ import zmq
 from vllm.logger import init_logger
 from vllm.utils.network_utils import (
     make_zmq_path,
-    make_zmq_socket,
 )
 
 if TYPE_CHECKING:
@@ -616,16 +615,12 @@ class MoRIIOWrapper:
 
         try:
             msg_str = msg.decode("UTF-8")
-            # Read-completion notifications carry the consumer's request_id.
-            # In upstream the prefix was assumed to be MoRIIOConstants.TRANSFER_PREFIX,
-            # but the toy-proxy convention embeds peer addresses into the request_id
-            # (e.g. "chatcmpl-___prefill_addr_host:...___decode_addr_host:..._UUID"),
-            # so the prefix never matches and the original code raised
-            # "Unhandled message format", killing the notify listener thread on the
-            # first read-completion. Treat any UTF-8 decoded payload as a completion
-            # message and let _handle_completion_message append it to done_req_ids;
-            # the scheduler's _update_from_kv_xfer_finished will reject anything that
-            # isn't a live request_id, so this stays safe.
+            # Completion notifications are UTF-8 identifiers. Depending on
+            # mode and peer version they may be transfer_ids, request_ids, or
+            # wrapped IDs; worker-side mapping normalizes them before the
+            # scheduler sees finished requests. Treat any UTF-8 payload as a
+            # completion and drop malformed binary payloads below so one bad
+            # packet cannot kill the notify listener thread.
             self._handle_completion_message(msg_str)
             handled = True
         except UnicodeDecodeError:
@@ -674,11 +669,10 @@ class MoRIIOWrapper:
             ctx = zmq.Context.instance()
             sock = ctx.socket(zmq.DEALER)
             # Notify rides a long-lived mgmt-rail TCP stream with sparse
-            # traffic. A silently dead peer (no FIN/RST) otherwise stalls
-            # delivery for the kernel retransmit ladder (~5 min observed:
-            # c77 14:25:47-14:30:54Z) while prefill serializes 30s handshake
-            # polls behind it. Keepalive (idle 30s, 3x10s probes) caps the
-            # stall: zmq drops the dead connection, reconnects and resends.
+            # traffic. A silently dead peer (no FIN/RST) can stall delivery
+            # until the kernel retransmit ladder expires while later control
+            # traffic queues behind it. Keepalive (idle 30s, 3x10s probes)
+            # caps the stall by forcing ZMQ to reconnect and resend.
             sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
             sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
             sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 10)
