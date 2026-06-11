@@ -1485,9 +1485,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states, input_batch, self.req_states
         )
 
-        # Post-step KV connector related operations.
-        kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-
         # Build the model runner output.
         model_runner_output = ModelRunnerOutput(
             req_ids=input_batch.req_ids,

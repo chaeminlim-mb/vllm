@@ -181,6 +181,51 @@ def get_moriio_mode(kv_transfer_config: KVTransferConfig) -> MoRIIOMode:
         return MoRIIOMode.WRITE
 
 
+def _normalize_node_hosts(value: Any, config_key: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [host.strip() for host in value.split(",") if host.strip()]
+    if isinstance(value, list):
+        hosts: list[str] = []
+        for host in value:
+            if not isinstance(host, str):
+                raise TypeError(
+                    f"{config_key} must be a list[str] or comma-separated string"
+                )
+            stripped = host.strip()
+            if stripped:
+                hosts.append(stripped)
+        return hosts
+    raise TypeError(f"{config_key} must be a list[str] or comma-separated string")
+
+
+def get_moriio_node_hosts(
+    kv_transfer_config: KVTransferConfig, default_host: str
+) -> list[str]:
+    extra_config = kv_transfer_config.kv_connector_extra_config
+    node_hosts = _normalize_node_hosts(
+        extra_config.get("node_hosts"),
+        "kv_connector_extra_config['node_hosts']",
+    )
+    if node_hosts:
+        return node_hosts
+
+    env_node_hosts = os.environ.get("VLLM_MORIIO_NODE_HOSTS", "").strip()
+    if env_node_hosts:
+        logger.warning_once(
+            "The environment variable %s is deprecated. Set %r inside "
+            "kv_transfer_config.kv_connector_extra_config instead.",
+            "VLLM_MORIIO_NODE_HOSTS",
+            "node_hosts",
+        )
+        node_hosts = _normalize_node_hosts(env_node_hosts, "VLLM_MORIIO_NODE_HOSTS")
+        if node_hosts:
+            return node_hosts
+
+    return [default_host]
+
+
 def get_port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
     return (dp_rank) * tp_size + tp_rank
 
@@ -226,6 +271,7 @@ class MoRIIOConfig:
     post_batch_size: int = -1
     num_workers: int = 1
     backend: str = "rdma"
+    node_hosts: list[str] = field(default_factory=list)
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> "MoRIIOConfig":
@@ -282,9 +328,10 @@ class MoRIIOConfig:
         defer_timeout = float(
             extra_config.get("defer_timeout", MoRIIOConstants.DEFAULT_DEFER_TIMEOUT)
         )
+        local_ip = get_ip()
 
         return cls(
-            local_ip=get_ip(),
+            local_ip=local_ip,
             local_kv_port=get_open_port(),
             proxy_ip=extra_config["proxy_ip"],
             local_ping_port=get_open_port(),
@@ -303,6 +350,7 @@ class MoRIIOConfig:
             post_batch_size=int(extra_config.get("post_batch_size", -1)),
             num_workers=int(extra_config.get("num_workers", 1)),
             backend=backend,
+            node_hosts=get_moriio_node_hosts(kv_transfer_config, local_ip),
         )
 
 
@@ -427,13 +475,15 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
         self.reqs_to_send: dict[ReqId, float] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
+        self.freed_transfer_ids: set[TransferId] = set()
 
     def __repr__(self):
         return (
             f"MoRIIOConnectorMetadata: reqs_to_recv={self.reqs_to_recv}, "
             f"reqs_to_save={self.reqs_to_save}, "
             f"reqs_to_send={self.reqs_to_send}, "
-            f"transfer_id_to_request_id={self.transfer_id_to_request_id}"
+            f"transfer_id_to_request_id={self.transfer_id_to_request_id}, "
+            f"freed_transfer_ids={self.freed_transfer_ids}"
         )
 
     def add_new_req(

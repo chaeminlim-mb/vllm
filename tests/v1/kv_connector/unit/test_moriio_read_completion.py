@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.config import KVTransferConfig
+
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOConfig,
     MoRIIOMode,
@@ -100,6 +102,7 @@ def make_worker() -> MoRIIOConnectorWorker:
     worker._pending_unmapped_done_tids = set()
     worker._unmatched_write_completions = set()
     worker.transfer_id_to_request_id = {}
+    worker.request_id_to_transfer_id = {}
     return worker
 
 
@@ -158,17 +161,20 @@ def test_moriio_config_notify_port_uses_tensor_parallel_size(
 
 
 def test_read_mode_extra_config_overrides_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    def make_config(extra_config: dict[str, object]) -> KVTransferConfig:
+        return KVTransferConfig(kv_connector_extra_config=extra_config)
+
     monkeypatch.setenv("VLLM_MORIIO_CONNECTOR_READ_MODE", "False")
-    assert get_moriio_mode({"read_mode": True}) == MoRIIOMode.READ
-    assert get_moriio_mode({"read_mode": "true"}) == MoRIIOMode.READ
+    assert get_moriio_mode(make_config({"read_mode": True})) == MoRIIOMode.READ
+    assert get_moriio_mode(make_config({"read_mode": "true"})) == MoRIIOMode.READ
 
     monkeypatch.setenv("VLLM_MORIIO_CONNECTOR_READ_MODE", "True")
-    assert get_moriio_mode({"read_mode": False}) == MoRIIOMode.WRITE
-    assert get_moriio_mode({"read_mode": "False"}) == MoRIIOMode.WRITE
-    assert get_moriio_mode({"read_mode": "0"}) == MoRIIOMode.WRITE
-    assert get_moriio_mode({"read_mode": "off"}) == MoRIIOMode.WRITE
-    assert get_moriio_mode({"read_mode": None}) == MoRIIOMode.WRITE
-    assert get_moriio_mode({}) == MoRIIOMode.READ
+    assert get_moriio_mode(make_config({"read_mode": False})) == MoRIIOMode.WRITE
+    assert get_moriio_mode(make_config({"read_mode": "False"})) == MoRIIOMode.WRITE
+    assert get_moriio_mode(make_config({"read_mode": "0"})) == MoRIIOMode.WRITE
+    assert get_moriio_mode(make_config({"read_mode": "off"})) == MoRIIOMode.WRITE
+    assert get_moriio_mode(make_config({"read_mode": None})) == MoRIIOMode.WRITE
+    assert get_moriio_mode(make_config({})) == MoRIIOMode.WRITE
 
 
 def make_req_meta(

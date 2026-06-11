@@ -1012,6 +1012,11 @@ class SpeculativeConfig:
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
             )
+        if self.relaxed_thinking and self.relax_top_k < 1:
+            raise ValueError(
+                "relax_top_k must be >= 1 when relaxed_thinking is enabled, "
+                f"got {self.relax_top_k}."
+            )
 
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates

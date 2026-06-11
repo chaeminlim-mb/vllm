@@ -626,10 +626,23 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 query_start_loc_device[1 : num_reqs + 1]
                 - query_start_loc_device[:num_reqs]
             ).to(torch.int32)
+            seq_lens_device_i32 = seq_lens_device.to(torch.int32)
+            if pad_uniform_mtp:
+                padded_rows = qo_lens_device == 0
+                qo_lens_device = torch.where(
+                    padded_rows,
+                    qo_lens_device.new_full((), max_qo_len),
+                    qo_lens_device,
+                )
+                seq_lens_device_i32 = torch.where(
+                    padded_rows,
+                    seq_lens_device_i32.new_full((), max_qo_len),
+                    seq_lens_device_i32,
+                )
             token_offsets = torch.arange(
                 max_qo_len, dtype=torch.int32, device=device
             )
-            flat_seq_lens = seq_lens_device.to(torch.int32).unsqueeze(1) - (
+            flat_seq_lens = seq_lens_device_i32.unsqueeze(1) - (
                 qo_lens_device.unsqueeze(1) - 1 - token_offsets.unsqueeze(0)
             )
             valid_tokens = token_offsets.unsqueeze(0) < qo_lens_device.unsqueeze(1)
@@ -677,7 +690,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 block_table_tensor,
                 block_table_tensor.stride(0),
                 paged_kv_indptr,
-                seq_lens_device.to(torch.int32),
+                seq_lens_device_i32,
                 qo_lens_device,
                 MAX_QO_LEN=max_qo_len,
                 KERNEL_BLOCK_SIZE=self.kernel_block_size,

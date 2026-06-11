@@ -251,13 +251,23 @@ class Scheduler(SchedulerInterface):
                     relax_ratio,
                     relax_top_k,
                 )
-                from transformers import AutoTokenizer
-
                 from vllm.reasoning import ReasoningParserManager
+                from vllm.tokenizers import cached_tokenizer_from_config
 
-                tokenizer = AutoTokenizer.from_pretrained(
-                    vllm_config.model_config.tokenizer
+                model_config = vllm_config.model_config
+                tokenizer_kwargs: dict[str, Any] = {
+                    "download_dir": vllm_config.load_config.download_dir,
+                }
+                if model_config.hf_token is not None:
+                    tokenizer_kwargs["token"] = model_config.hf_token
+                tokenizer = cached_tokenizer_from_config(
+                    model_config, **tokenizer_kwargs
                 )
+                if tokenizer is None:
+                    raise ValueError(
+                        "skip_tokenizer_init cannot be used when "
+                        "relaxed_thinking is enabled."
+                    )
                 parser_cls = ReasoningParserManager.get_reasoning_parser(
                     speculative_config.reasoning_parser
                 )

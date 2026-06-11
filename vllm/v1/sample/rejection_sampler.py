@@ -465,8 +465,7 @@ def rejection_sample(
     if not sampling_metadata.all_random:
         # Relaxed acceptance (PR #22238) — greedy path only, no synthetic mode.
         # Falls back to strict greedy kernel when feature off OR when
-        # thinking_states empty (e.g. relaxed enabled but no req in thinking
-        # phase yet in this batch).
+        # thinking_states are unavailable/misaligned.
         use_relaxed = (
             relaxed_thinking
             and not synthetic_mode
@@ -474,6 +473,7 @@ def rejection_sample(
             and thinking_states.numel() == batch_size
         )
         if use_relaxed:
+            relax_top_k = min(relax_top_k, vocab_size)
             # target_probs computed early for relaxed path.
             relaxed_target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
             topk_values, topk_indices = torch.topk(

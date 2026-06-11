@@ -3549,8 +3549,8 @@ class GPUModelRunner(
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
 
         # Relaxed acceptance (PR #22238). Only build the thinking_states tensor
-        # when the feature is enabled in speculative_config. Falls back to
-        # strict path inside the sampler if tensor not provided.
+        # when the feature is enabled in speculative_config. Its rows must match
+        # the post-reorder input_batch order used for num_draft_tokens.
         relaxed_thinking = False
         relax_ratio = 1.0
         relax_top_k = 1
@@ -3562,15 +3562,20 @@ class GPUModelRunner(
             relaxed_thinking = True
             relax_ratio = self.speculative_config.relax_ratio
             relax_top_k = self.speculative_config.relax_top_k
-            if (
-                scheduler_output is not None
-                and scheduler_output.scheduled_cached_reqs.thinking_states
-            ):
-                thinking_states_tensor = torch.tensor(
-                    scheduler_output.scheduled_cached_reqs.thinking_states,
-                    dtype=torch.bool,
-                    device=self.device,
+            thinking_states_by_req_id: dict[str, bool] = {}
+            if scheduler_output is not None:
+                cached_req_data = scheduler_output.scheduled_cached_reqs
+                thinking_states_by_req_id = dict(
+                    zip(cached_req_data.req_ids, cached_req_data.thinking_states)
                 )
+            thinking_states_tensor = torch.tensor(
+                [
+                    thinking_states_by_req_id.get(req_id, False)
+                    for req_id in self.input_batch.req_ids
+                ],
+                dtype=torch.bool,
+                device=self.device,
+            )
 
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import math
-import os
 import queue
 import re
 import threading
@@ -37,6 +36,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     TransferId,
     WriteTask,
     get_moriio_mode,
+    get_moriio_node_hosts,
     get_peer_zmq_from_request_id,
     get_port_offset,
     get_role,
@@ -110,6 +110,28 @@ def _get_bool_extra_config(extra_config: dict[str, Any], key: str) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     return bool(value)
+
+
+def _pick_remote_rank_host(
+    default_host: str,
+    remote_hosts: list[str] | None,
+    tp_size: int,
+    tp_rank: int,
+    remote_dp_size: int = 1,
+    remote_dp_rank: int = 0,
+) -> str:
+    if remote_hosts and len(remote_hosts) > 1:
+        n_hosts = len(remote_hosts)
+        if int(remote_dp_size) >= n_hosts:
+            dp_per_node = max(1, int(remote_dp_size) // n_hosts)
+            node_idx = int(remote_dp_rank) // dp_per_node
+            if 0 <= node_idx < n_hosts:
+                return remote_hosts[node_idx]
+        ranks_per_node = max(1, int(tp_size) // n_hosts)
+        node_idx = int(tp_rank) // ranks_per_node
+        if 0 <= node_idx < n_hosts:
+            return remote_hosts[node_idx]
+    return default_host
 
 
 class MoRIIOConnector(KVConnectorBase_V1):
@@ -298,18 +320,11 @@ class MoRIIOConnectorScheduler:
         self.engine_id: EngineId = engine_id
         self.mode = get_moriio_mode(self.kv_transfer_config)
         self.host_ip = get_ip()
-        # Multi-node TP: VLLM_MORIIO_NODE_HOSTS holds the ordered list of host
-        # IPs in this engine's TP group (rank 0 first). Surfaced to the peer
-        # side via request_finished's kv_transfer_params so the consumer
-        # workers can dial the correct producer host for their tp_rank. For
-        # single-node TP, falls back to [host_ip].
-        node_hosts_env = os.environ.get("VLLM_MORIIO_NODE_HOSTS", "").strip()
-        if node_hosts_env:
-            self.node_hosts: list[str] = [
-                h.strip() for h in node_hosts_env.split(",") if h.strip()
-            ]
-        else:
-            self.node_hosts = [self.host_ip]
+        # Multi-node TP: node_hosts holds the ordered host IPs in this
+        # engine's TP group (rank 0 first). Surfaced to the peer side via
+        # request_finished's kv_transfer_params so workers can dial the rank
+        # owner. Single-node TP falls back to [host_ip].
+        self.node_hosts = get_moriio_node_hosts(self.kv_transfer_config, self.host_ip)
         self.handshake_port = self.kv_transfer_config.kv_connector_extra_config[
             "handshake_port"
         ]
@@ -362,6 +377,7 @@ class MoRIIOConnectorScheduler:
         self.paths: dict[str, zmq.Socket] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
+        self._transfer_ids_to_forget: set[TransferId] = set()
 
     def map_request_id(self, request_id: ReqId, transfer_id: TransferId):
         self.transfer_id_to_request_id[transfer_id] = request_id
@@ -501,17 +517,29 @@ class MoRIIOConnectorScheduler:
                     request.request_id, is_producer=False
                 )
                 remote_host, _, remote_notify_port = parse_moriio_zmq_address(peer_zmq)
+                remote_hosts_raw = request.kv_transfer_params.get("remote_hosts") or []
+                if isinstance(remote_hosts_raw, str):
+                    remote_hosts = [remote_hosts_raw] if remote_hosts_raw else None
+                else:
+                    remote_hosts = list(remote_hosts_raw) or None
 
                 for tp_index in range(self.tp_size):
                     target_port = remote_notify_port + get_port_offset(
                         remote_dp_rank, tp_index, self.tp_size
                     )
-
+                    target_host = _pick_remote_rank_host(
+                        remote_host,
+                        remote_hosts,
+                        self.tp_size,
+                        tp_index,
+                        int(request.kv_transfer_params.get("remote_dp_size", 1)),
+                        int(remote_dp_rank),
+                    )
                     self.send_notify_block(
                         req_id=request.request_id,
                         transfer_id=request.kv_transfer_params["transfer_id"],
                         block_notify_list=blocks.get_block_ids()[0],
-                        host=remote_host,
+                        host=target_host,
                         port=target_port,
                     )
 
@@ -525,6 +553,9 @@ class MoRIIOConnectorScheduler:
     ) -> KVConnectorMetadata:
         meta = MoRIIOConnectorMetadata()
         meta.transfer_id_to_request_id = self.transfer_id_to_request_id
+        if self._transfer_ids_to_forget:
+            meta.freed_transfer_ids = set(self._transfer_ids_to_forget)
+            self._transfer_ids_to_forget.clear()
 
         if self.mode == MoRIIOMode.WRITE:
             # when async_load_kv finished,
@@ -722,6 +753,9 @@ class MoRIIOConnectorScheduler:
         # Consumer: unmapping already done in request_finished
         if self.is_producer and connector_output.finished_sending:
             for req_id in connector_output.finished_sending:
+                transfer_id = self.request_id_to_transfer_id.get(req_id)
+                if transfer_id is not None:
+                    self._transfer_ids_to_forget.add(transfer_id)
                 self.unmap_request_id(req_id)
 
         if not self._deferred_send_deadlines:
@@ -749,6 +783,9 @@ class MoRIIOConnectorScheduler:
             connector_output.finished_sending = set()
         # Register the expired requests as finished so the scheduler frees their blocks.
         for req_id in expired_reqs:
+            transfer_id = self.request_id_to_transfer_id.get(req_id)
+            if transfer_id is not None:
+                self._transfer_ids_to_forget.add(transfer_id)
             connector_output.finished_sending.add(req_id)
             del self._deferred_send_deadlines[req_id]
             if self.is_producer:
@@ -764,6 +801,8 @@ class MoRIIOConnectorScheduler:
         )
 
     def has_pending_deferred_sends(self) -> bool:
+        if self._transfer_ids_to_forget:
+            return True
         if not self._deferred_send_deadlines:
             return False
         now = time.monotonic()
@@ -819,13 +858,7 @@ class MoRIIOConnectorWorker:
         self.handshake_port = self.moriio_config.handshake_port
         self.notify_port = self.moriio_config.notify_port
 
-        node_hosts_env = os.environ.get("VLLM_MORIIO_NODE_HOSTS", "").strip()
-        if node_hosts_env:
-            self.node_hosts: list[str] = [
-                host.strip() for host in node_hosts_env.split(",") if host.strip()
-            ]
-        else:
-            self.node_hosts = [self.local_ip]
+        self.node_hosts = self.moriio_config.node_hosts
         self.dp_rank_to_host: dict[int, str] = {}
 
         self.zmq_context = zmq.Context()
@@ -1351,25 +1384,19 @@ class MoRIIOConnectorWorker:
         first). If unset or length 1, falls back to meta.remote_host
         (single-host behaviour, preserves TP=8 and monolithic correctness).
         """
-        if meta.remote_hosts and len(meta.remote_hosts) > 1:
-            ranks_per_node = max(1, int(meta.tp_size) // len(meta.remote_hosts))
-            node_idx = self.tp_rank // ranks_per_node
-            if 0 <= node_idx < len(meta.remote_hosts):
-                return meta.remote_hosts[node_idx]
-        return meta.remote_host
+        return _pick_remote_rank_host(
+            meta.remote_host, meta.remote_hosts, int(meta.tp_size), self.tp_rank
+        )
 
     def _pick_host_for_dp_rank(self, meta: ReqMeta, dp_rank: int) -> str:
-        if meta.remote_hosts and len(meta.remote_hosts) > 1:
-            n_hosts = len(meta.remote_hosts)
-            if int(meta.remote_dp_size) >= n_hosts:
-                dp_per_node = max(1, int(meta.remote_dp_size) // n_hosts)
-                node_idx = dp_rank // dp_per_node
-                if 0 <= node_idx < n_hosts:
-                    return meta.remote_hosts[node_idx]
-            if int(meta.tp_size) > 1:
-                return self._pick_remote_host(meta)
-            return self._pick_remote_host(meta)
-        return meta.remote_host
+        return _pick_remote_rank_host(
+            meta.remote_host,
+            meta.remote_hosts,
+            int(meta.tp_size),
+            self.tp_rank,
+            int(meta.remote_dp_size),
+            dp_rank,
+        )
 
     def _background_moriio_handshake(
         self, req_id: ReqId, remote_engine_id: EngineId, meta: ReqMeta
@@ -1683,7 +1710,7 @@ class MoRIIOConnectorWorker:
                     req_id,
                 )
                 return
-            self.transfer_id_to_request_id.pop(xfer_id, None)
+            self._forget_transfer_mapping(xfer_id, req_id)
         else:
             logger.warning(
                 "No READ completion callback address for failed request %s",
@@ -1888,6 +1915,10 @@ class MoRIIOConnectorWorker:
         # request_id, and that notification can arrive several steps after
         # request_finished. get_finished() pops entries after a successful
         # translation, so the dict stays bounded.
+        for transfer_id in metadata.freed_transfer_ids:
+            self._forget_transfer_mapping(transfer_id)
+        self._pending_unmapped_done_tids.difference_update(metadata.freed_transfer_ids)
+        self._unmatched_write_completions.difference_update(metadata.freed_transfer_ids)
         for transfer_id, req_id in metadata.transfer_id_to_request_id.items():
             self._remember_transfer_mapping(transfer_id, req_id)
         if self.is_producer:
@@ -1981,7 +2012,7 @@ class MoRIIOConnectorWorker:
             layer_name=layer_name,
             kv_layer=kv_layer,
             remote_notify_port=meta.remote_notify_port,
-            remote_ip=meta.remote_host,
+            remote_ip=self._pick_host_for_dp_rank(meta, int(meta.remote_dp_rank)),
         )
 
     def merge_contiguous_blocks(
