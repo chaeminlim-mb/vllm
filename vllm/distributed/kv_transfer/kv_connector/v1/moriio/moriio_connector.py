@@ -136,9 +136,7 @@ class MoRIIOConnector(KVConnectorBase_V1):
             + ":"
             + str(self.kv_transfer_config.kv_connector_extra_config["handshake_port"])
         )
-        self.mode = get_moriio_mode(
-            self.kv_transfer_config.kv_connector_extra_config
-        )
+        self.mode = get_moriio_mode(self.kv_transfer_config)
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: MoRIIOConnectorScheduler | None = (
                 MoRIIOConnectorScheduler(vllm_config, self.engine_id)
@@ -298,9 +296,7 @@ class MoRIIOConnectorScheduler:
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.block_size = vllm_config.cache_config.block_size
         self.engine_id: EngineId = engine_id
-        self.mode = get_moriio_mode(
-            self.kv_transfer_config.kv_connector_extra_config
-        )
+        self.mode = get_moriio_mode(self.kv_transfer_config)
         self.host_ip = get_ip()
         # Multi-node TP: VLLM_MORIIO_NODE_HOSTS holds the ordered list of host
         # IPs in this engine's TP group (rank 0 first). Surfaced to the peer
@@ -359,7 +355,7 @@ class MoRIIOConnectorScheduler:
         self._defer_drain_grace = float(
             self.kv_transfer_config.kv_connector_extra_config.get(
                 "defer_drain_grace",
-                os.environ.get("VLLM_MORIIO_DEFER_DRAIN_GRACE_S", "2.0"),
+                MoRIIOConstants.DEFAULT_DEFER_DRAIN_GRACE,
             )
         )
         self._deferred_send_drain_until = 0.0
@@ -792,8 +788,8 @@ class MoRIIOConnectorWorker:
         self.vllm_config = vllm_config
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.moriio_config = MoRIIOConfig.from_vllm_config(vllm_config)
-        self.mode = get_moriio_mode(
-            self.kv_transfer_config.kv_connector_extra_config
+        self.mode = (
+            MoRIIOMode.READ if self.moriio_config.read_mode else MoRIIOMode.WRITE
         )
 
         logger.info("Initializing MoRIIO worker %s", engine_id)
@@ -885,7 +881,17 @@ class MoRIIOConnectorWorker:
             transfer_timeout=self.moriio_config.transfer_timeout,
         )
         self.moriio_wrapper.set_moriio_engine(self.moriio_engine)
-        self.moriio_wrapper.set_backend_type(BackendType.RDMA)
+        backend = (
+            BackendType.XGMI
+            if self.moriio_config.backend == "xgmi"
+            else BackendType.RDMA
+        )
+        self.moriio_wrapper.set_backend_type(
+            backend,
+            qp_per_transfer=self.moriio_config.qp_per_transfer,
+            post_batch_size=self.moriio_config.post_batch_size,
+            num_workers=self.moriio_config.num_workers,
+        )
         self.moriio_wrapper.notify_port = self.moriio_config.notify_port
         self.local_kv_cache_metadata: list[bytes] = []
         self.local_kv_cache_size: list[int] = []
@@ -1597,7 +1603,6 @@ class MoRIIOConnectorWorker:
                 # request_id to done_req_ids in _finalize_if_complete, so no
                 # translation is required.
                 done_sending = done_sending_raw
-
         else:
             if self.mode == MoRIIOMode.WRITE:
                 fresh = self.moriio_wrapper.pop_finished_write_req_ids()
