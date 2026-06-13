@@ -51,6 +51,8 @@ if envs.VLLM_USE_SPINLOOP_EXT:
         logger.warning(
             "spinloop extension could not be loaded, disabling VLLM_USE_SPINLOOP_EXT!"
         )
+SHM_READER_RECHECK_INTERVAL_MS = 5000
+
 SPINLOOP_TIMEOUT_SECONDS = 0.1
 
 if TYPE_CHECKING:
@@ -625,12 +627,11 @@ class MessageQueue:
             # Never park indefinitely: the notify ping channel is best-effort
             # by design (PUB SNDHWM=1 drops silently, SUB is CONFLATE), so a
             # parked reader must periodically recheck the authoritative SHM
-            # written-flag or one lost ping wedges the whole DP group.
-            # Warning readers keep the 60s warn cadence; indefinite readers
-            # recheck every 5s (idle-only cost, ~0.2 wakeups/s).
-            self.warning_wait_time_ms: int = (
-                VLLM_RINGBUFFER_WARNING_INTERVAL * 1000 if should_warn else 5000
-            )
+            # written-flag or one lost ping can block the whole reader group.
+            # Keep warning cadence independent from polling cadence: warning
+            # readers still log every VLLM_RINGBUFFER_WARNING_INTERVAL seconds,
+            # but all idle readers recheck every SHM_READER_RECHECK_INTERVAL_MS.
+            self.recheck_interval_ms = SHM_READER_RECHECK_INTERVAL_MS
 
             self._should_warn = should_warn
             self.n_warning = 1
@@ -638,21 +639,19 @@ class MessageQueue:
 
         def timeout_ms(self) -> int | None:
             """Returns a timeout that is:
-            - min(time to deadline, time to next warning) if we're logging warnings
-            - time to deadline, if we're not logging warnings
-            - None if the timeout is None and we're not logging warnings
+            - reader recheck interval if the timeout is None
+            - min(time to deadline, reader recheck interval) if timeout is set
             - raise TimeoutError if we are past the deadline
             """
-            warning_wait_time = self.warning_wait_time_ms
             if self.timeout is None:
-                return warning_wait_time
+                return self.recheck_interval_ms
 
             time_left_ms = int((self.deadline - time.monotonic()) * 1000)
             if time_left_ms <= 0:
                 raise TimeoutError
 
-            if warning_wait_time and warning_wait_time < time_left_ms:
-                return warning_wait_time
+            if self.recheck_interval_ms < time_left_ms:
+                return self.recheck_interval_ms
 
             return time_left_ms
 
