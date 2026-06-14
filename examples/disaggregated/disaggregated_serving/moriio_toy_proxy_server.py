@@ -214,8 +214,30 @@ async def stream_decode_response(session, response, request_id):
         await session.close()
 
 
-def example_round_robin_dp_loader(request_number, dp_size):
-    return (request_number - 1) % dp_size
+def flat_interleaved_dp_route(request_number, instances):
+    """Flat round-robin over the full (instance, dp_rank) slot space.
+
+    ONE counter over (n_instances * dp_size) slots, so instance-selection and
+    DP-rank-selection are derived from the SAME index and can never alias. The
+    previous scheme computed instance = (req-1) % n and rank = (req-1) % dp from
+    the same req-1 with n | dp, which locked each instance to a stride-n subset
+    of its ranks (2 producers -> 4 of 8 ranks each -> half the GPUs idle ->
+    false "2P doesn't scale").
+
+    Interleaved order — inst0_r0, inst1_r0, inst0_r1, inst1_r1, ... — so
+    consecutive requests alternate instances AND every rank gets walked.
+
+    Assumes homogeneous dp_size across a role's instances (true for these
+    DP8EP / TPn deployments). Returns (instance_index, dp_rank); dp_rank is
+    None when dp_size == 1 (e.g. TP decode), which avoids forwarding an
+    out-of-range rank.
+    """
+    n = len(instances)
+    dp = instances[0]["dp_size"]
+    slot = (request_number - 1) % (n * dp)
+    inst_idx = slot % n
+    dp_rank = (slot // n) if dp > 1 else None
+    return inst_idx, dp_rank
 
 
 @app.route("/health", methods=["GET"])
@@ -257,30 +279,22 @@ async def handle_request(api: str, request: Request):
                     503,
                 )
             )
-        pid = (request_number - 1) % len(prefill_instances)
-        did = (request_number - 1) % len(decode_instances)
+        # Flat interleaved round-robin per side (see flat_interleaved_dp_route):
+        # one counter over the full (instance, dp_rank) slot space, so
+        # instance-selection and DP-rank-selection can never alias. Order is
+        # interleaved — inst0_r0, inst1_r0, inst0_r1, inst1_r1, ... — so
+        # consecutive requests alternate instances AND every rank is walked.
+        pid, selected_prefill_dp_rank = flat_interleaved_dp_route(
+            request_number, prefill_instances
+        )
+        # Decode uses its OWN dp_size (not the prefill's): for heterogeneous P/D
+        # (e.g. DP8EP prefill + TP8 decode, dp_size=1) dp_rank is None, avoiding
+        # "data_parallel_rank N out of range [0,1)" -> 400 on the decode.
+        did, selected_decode_dp_rank = flat_interleaved_dp_route(
+            request_number, decode_instances
+        )
         prefill_instance_endpoint = prefill_instances[pid]
         decode_instance_endpoint = decode_instances[did]
-
-        selected_prefill_dp_rank = None
-        if prefill_instance_endpoint["dp_size"] > 1:
-            selected_prefill_dp_rank = example_round_robin_dp_loader(
-                request_number,
-                prefill_instance_endpoint["dp_size"],
-            )
-
-        # Decode routes to its OWN dp rank, derived from the DECODE's dp_size —
-        # not the prefill's. With heterogeneous parallelism (e.g. DP8EP prefill +
-        # TP8 decode, dp_size=1), forwarding the prefill rank yields
-        # "data_parallel_rank N out of range [0,1)" -> 400 on the decode. For
-        # uniform DP8<->DP8 this matches the prefill rank (same loader/args), so
-        # behavior is unchanged there.
-        selected_decode_dp_rank = None
-        if decode_instance_endpoint["dp_size"] > 1:
-            selected_decode_dp_rank = example_round_robin_dp_loader(
-                request_number,
-                decode_instance_endpoint["dp_size"],
-            )
 
         # Embed both zmq_addresses in the request_id so the connector can parse
         # the peer's host/ports from it, similar to P2P-NCCL
