@@ -1928,9 +1928,10 @@ class MoRIIOConnectorWorker:
                     # per-layer statuses are Succeeded, BEFORE send_notify
                     # (so a retry on send_notify failure does not move the
                     # ts). First-stamp-wins.
-                    if req_id not in self._kv_xfer_complete_ts_mono:
-                        self._kv_xfer_complete_ts_mono[req_id] = time.monotonic()
-                        self._kv_xfer_complete_ts_wallclock[req_id] = time.time()
+                    if os.getenv("VLLM_PD_STAGE_TELEMETRY", "0") == "1":
+                        if req_id not in self._kv_xfer_complete_ts_mono:
+                            self._kv_xfer_complete_ts_mono[req_id] = time.monotonic()
+                            self._kv_xfer_complete_ts_wallclock[req_id] = time.time()
                     try:
                         self.moriio_wrapper.send_notify(xfer_id, host, port)
                     except Exception:
@@ -2467,9 +2468,10 @@ class MoRIIOConnectorWorker:
         # inside _pop_done_transfers' success branch; together they give
         # the NTP-independent kv_xfer_time. First-stamp-wins under the
         # wrapper lock — retries of the same req should not overwrite.
-        with self.moriio_wrapper.lock:
-            if req_id not in self._kv_xfer_start_ts_mono:
-                self._kv_xfer_start_ts_mono[req_id] = time.monotonic()
+        if os.getenv("VLLM_PD_STAGE_TELEMETRY", "0") == "1":
+            with self.moriio_wrapper.lock:
+                if req_id not in self._kv_xfer_start_ts_mono:
+                    self._kv_xfer_start_ts_mono[req_id] = time.monotonic()
         self._read_blocks(
             request_id=req_id,
             transfer_id=meta.transfer_id,
