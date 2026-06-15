@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     ROLE,
     EngineId,
     HandshakeError,
+    LayerTransferPlan,
     MoRIIOAgentMetadata,
     MoRIIOConfig,
     MoRIIOConnectorMetadata,
@@ -389,7 +390,7 @@ class MoRIIOConnectorScheduler:
         self.transfer_id_to_request_id[transfer_id] = request_id
         self.request_id_to_transfer_id[request_id] = transfer_id
 
-    def unmap_request_id(self, request_id: ReqId):
+    def unmap_request_id(self, request_id: ReqId, warn_missing: bool = True):
         if request_id in self.request_id_to_transfer_id:
             transfer_id = self.request_id_to_transfer_id[request_id]
             del self.request_id_to_transfer_id[request_id]
@@ -400,7 +401,7 @@ class MoRIIOConnectorScheduler:
                     "transfer id not in transfer_id_to_request_id lookup"
                     "table. there is likely a bug!"
                 )
-        else:
+        elif warn_missing:
             logger.warning(
                 "Could not find %s  in transfer_id_to_request_id"
                 "lookup table.  This could lead to a possible hang.",
@@ -490,15 +491,16 @@ class MoRIIOConnectorScheduler:
                         # a full prefix cache hit on the D worker. We need to call
                         # send_notify in _read_blocks to free the memory on the P.
 
-                        # Get local blocks to pull remote KV into. If the
-                        # producer returned a longer remote list, trim the
-                        # remote suffix to match the local allocation. Do not
-                        # replace local ids: they index the decode KV cache.
+                        # Get local blocks to pull remote KV into. The two
+                        # block lists must describe the same token span.
+                        # Do not trim here: a mismatch is a target-condition
+                        # bug, not a valid official-regression pass path.
                         local_block_ids = blocks.get_block_ids()[0]
-                        assert len(local_block_ids) <= len(remote_block_ids)
-                        if len(local_block_ids) != len(remote_block_ids):
-                            remote_block_ids = remote_block_ids[-len(local_block_ids) :]
-                            params["remote_block_ids"] = remote_block_ids
+                        assert len(local_block_ids) == len(remote_block_ids), (
+                            "MoRIIO READ block id count mismatch: "
+                            f"local={len(local_block_ids)} "
+                            f"remote={len(remote_block_ids)}"
+                        )
 
                         self._reqs_need_recv[request.request_id] = (
                             request,
@@ -668,15 +670,20 @@ class MoRIIOConnectorScheduler:
         should be freed now or will be sent asynchronously and freed later.
         """
 
+        params = request.kv_transfer_params
         request_id = request.request_id
         # Consumer: can unmap transfer_id<->request_id immediately since done_recving
         #   has fired at this point (i.e. KV has been transferred)
         # Producer: must keep the mapping until we get notification that blocks can
         #   be freed, which may be several scheduler steps later.
         if not self.is_producer:
-            self.unmap_request_id(request_id)
-
-        params = request.kv_transfer_params
+            mapping_was_never_created = bool(
+                params and params.get("do_remote_prefill")
+            )
+            self.unmap_request_id(
+                request_id,
+                warn_missing=not mapping_was_never_created,
+            )
         logger.debug(
             "MoriioConnector request_finished, request_status=%s, "
             "kv_transfer_params=%s",
@@ -979,6 +986,9 @@ class MoRIIOConnectorWorker:
         self.dst_num_blocks: dict[EngineId, int] = {}
         # In-progress READ transfers: per request, keyed by layer name.
         self._recving_transfers: defaultdict[ReqId, dict[str, Any]] = defaultdict(dict)
+        self._pending_read_plans: defaultdict[
+            ReqId, dict[str, LayerTransferPlan]
+        ] = defaultdict(dict)
         # Values are (remote_host, remote_notify_port, transfer_id).
         self._recving_transfers_callback_addr: dict[ReqId, tuple[str, str, str]] = {}
         self._recving_transfer_local_block_ids: dict[ReqId, set[int]] = {}
@@ -1772,6 +1782,7 @@ class MoRIIOConnectorWorker:
                 req_id,
             )
         self._recving_transfers.pop(req_id, None)
+        self._pending_read_plans.pop(req_id, None)
         self._recving_transfers_callback_addr.pop(req_id, None)
         self._recving_transfer_local_block_ids.pop(req_id, None)
 
@@ -1791,20 +1802,145 @@ class MoRIIOConnectorWorker:
             return bool(status.Failed()) and "SQ full" in (status.Message() or "")
         except Exception:
             return False
+
+    @staticmethod
+    def _read_status_active(status) -> bool:
+        return not status.Succeeded() and not status.Failed()
+
+    def _active_read_layer_count_locked(self) -> int:
+        return sum(
+            1
+            for status_by_layer in self._recving_transfers.values()
+            for status in status_by_layer.values()
+            if self._read_status_active(status)
+        )
+
+    def _active_read_layers_for_req_locked(self, req_id: ReqId) -> int:
+        status_by_layer = self._recving_transfers.get(req_id, {})
+        return sum(
+            1
+            for status in status_by_layer.values()
+            if self._read_status_active(status)
+        )
+
+    def _per_transfer_read_cap(self) -> int:
+        caps = [
+            cap
+            for cap in (
+                self.moriio_config.max_inflight_per_transfer,
+                self.moriio_config.max_dispatch_layers,
+            )
+            if cap > 0
+        ]
+        return min(caps) if caps else 0
+
+    def _can_dispatch_read_plan_locked(self, req_id: ReqId) -> bool:
+        active_layers = self._active_read_layers_for_req_locked(req_id)
+        per_transfer_cap = self._per_transfer_read_cap()
+        if per_transfer_cap > 0 and active_layers >= per_transfer_cap:
+            return False
+
+        global_cap = self.moriio_config.max_inflight_global
+        if global_cap > 0 and self._active_read_layer_count_locked() >= global_cap:
+            return False
+
+        return True
+
+    def _take_dispatchable_read_plan(
+        self, layer_name: str | None = None
+    ) -> LayerTransferPlan | None:
+        with self.moriio_wrapper.lock:
+            for req_id, plans_by_layer in list(self._pending_read_plans.items()):
+                if layer_name is None:
+                    if not plans_by_layer:
+                        continue
+                    plan_layer_name = next(iter(plans_by_layer))
+                else:
+                    if layer_name not in plans_by_layer:
+                        continue
+                    plan_layer_name = layer_name
+
+                if not self._can_dispatch_read_plan_locked(req_id):
+                    continue
+
+                plan = plans_by_layer.pop(plan_layer_name)
+                if not plans_by_layer:
+                    self._pending_read_plans.pop(req_id, None)
+                return plan
+
+        return None
+
+    def _post_read_plan(self, plan: LayerTransferPlan) -> None:
+        _sq_deadline = time.monotonic() + self.moriio_config.transfer_timeout
+        _backoff = 0.001
+        while True:
+            try:
+                transfer_status = self.moriio_wrapper.read_remote_data(
+                    plan.transfer_sizes,
+                    plan.transfer_local_offsets,
+                    plan.transfer_remote_offsets,
+                    plan.session,
+                )
+            except Exception as e:
+                with self.moriio_wrapper.lock:
+                    has_partial_status = bool(
+                        self._recving_transfers.get(plan.request_id)
+                    )
+                    self._handle_failed_read_transfer_locked(
+                        plan.request_id,
+                        error=e,
+                        record_invalid_blocks=has_partial_status,
+                    )
+                raise
+            if not self._is_sq_full_status(transfer_status):
+                break
+            if time.monotonic() > _sq_deadline:
+                logger.warning(
+                    "MoRIIO READ send queue stayed full past transfer_timeout "
+                    "for req %s layer %s; storing failed status (handled "
+                    "non-fatally in wait_for_layer_load). Raise "
+                    "VLLM_MORIIO_QP_PER_TRANSFER and/or "
+                    "MORI_IO_SQ_BACKOFF_TIMEOUT_US if frequent.",
+                    plan.request_id,
+                    plan.layer_name,
+                )
+                break
+            time.sleep(_backoff)
+            _backoff = min(_backoff * 2, 0.05)
+
+        with self.moriio_wrapper.lock:
+            self._recving_transfers[plan.request_id][plan.layer_name] = (
+                transfer_status
+            )
+
+    def _dispatch_pending_reads(self, layer_name: str | None = None) -> None:
+        while True:
+            plan = self._take_dispatchable_read_plan(layer_name)
+            if plan is None:
+                return
+            self._post_read_plan(plan)
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         if self.is_producer or self.mode != MoRIIOMode.READ:
             return
 
         deadline = time.monotonic() + self.moriio_config.transfer_timeout
         while True:
+            self._dispatch_pending_reads(layer_name)
+
             with self.moriio_wrapper.lock:
+                pending_plan_req_ids = {
+                    req_id
+                    for req_id, plans_by_layer in self._pending_read_plans.items()
+                    if layer_name in plans_by_layer
+                }
                 pending = [
                     (req_id, status_by_layer[layer_name])
                     for req_id, status_by_layer in self._recving_transfers.items()
                     if layer_name in status_by_layer
                 ]
 
-            if not pending:
+            if not pending and not pending_plan_req_ids:
                 return
 
             still_running = False
@@ -1839,7 +1975,8 @@ class MoRIIOConnectorWorker:
                     )
                 still_running = True
 
-            if not still_running:
+            if not still_running and not pending_plan_req_ids:
+                self._dispatch_pending_reads()
                 return
 
             if time.monotonic() > deadline:
@@ -1849,7 +1986,9 @@ class MoRIIOConnectorWorker:
                     "kv_connector_extra_config.transfer_timeout"
                 )
                 with self.moriio_wrapper.lock:
-                    for req_id, _status in pending:
+                    req_ids = {req_id for req_id, _status in pending}
+                    req_ids.update(pending_plan_req_ids)
+                    for req_id in req_ids:
                         self._handle_failed_read_transfer_locked(req_id, error=error)
                 raise error
 
@@ -1877,7 +2016,11 @@ class MoRIIOConnectorWorker:
                 failed_status = next(
                     (status for status in statuses if status.Failed()), None
                 )
-                if statuses and all(status.Succeeded() for status in statuses):
+                if (
+                    statuses
+                    and req_id not in self._pending_read_plans
+                    and all(status.Succeeded() for status in statuses)
+                ):
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     try:
                         self.moriio_wrapper.send_notify(xfer_id, host, port)
@@ -1897,6 +2040,7 @@ class MoRIIOConnectorWorker:
                     # The request will expire via the normal request timeout.
             for req_id in to_remove:
                 self._recving_transfers.pop(req_id, None)
+                self._pending_read_plans.pop(req_id, None)
                 self._recving_transfers_callback_addr.pop(req_id, None)
                 self._recving_transfer_local_block_ids.pop(req_id, None)
 
@@ -2437,55 +2581,19 @@ class MoRIIOConnectorWorker:
                 transfer_id,
             )
 
-        # SQ-full backpressure deadline (shared across this request's layers).
-        _sq_deadline = time.monotonic() + self.moriio_config.transfer_timeout
-        for layer_name in self.layer_name_to_local_kv_cache_metadata:
-            sess_idx = list(self.layer_name_to_local_kv_cache_metadata.keys()).index(
-                layer_name
-            )
-            # TODO : apply multi-session batch-read when moriio support it
-            # SQ-full backpressure. read_remote_data posts the RDMA READ
-            # SYNCHRONOUSLY (the mori executor joins its worker before returning
-            # — executor.cpp:174-183 — and marks the status on this thread,
-            # backend_impl.cpp:1007), so a send-queue-full rejection is a
-            # Failed() status right here (ERR_RDMA_OP, msg "SQ full"). The SQ is
-            # per-QP and HW-capped (bnxt max_qp_wr=4351); a SEPARATE CQ-poll
-            # thread (NotifManager) drains completions and frees SQ depth, so we
-            # back off and RE-POST instead of letting the failure reach
-            # wait_for_layer_load and kill the worker. No self-deadlock (drain is
-            # off-thread); the reserve is all-or-nothing so nothing was posted on
-            # a rejected attempt. Bounded by transfer_timeout.
-            _backoff = 0.001
-            while True:
-                try:
-                    transfer_status = self.moriio_wrapper.read_remote_data(
-                        offs[2], offs[0], offs[1], sessions[sess_idx]
-                    )
-                except Exception as e:
-                    with self.moriio_wrapper.lock:
-                        has_partial_status = bool(
-                            self._recving_transfers.get(request_id)
-                        )
-                        self._handle_failed_read_transfer_locked(
-                            request_id,
-                            error=e,
-                            record_invalid_blocks=has_partial_status,
-                        )
-                    raise
-                if not self._is_sq_full_status(transfer_status):
-                    break
-                if time.monotonic() > _sq_deadline:
-                    logger.warning(
-                        "MoRIIO READ send queue stayed full past "
-                        "transfer_timeout for req %s layer %s; storing failed "
-                        "status (handled non-fatally in wait_for_layer_load). "
-                        "Raise VLLM_MORIIO_QP_PER_TRANSFER and/or "
-                        "MORI_IO_SQ_BACKOFF_TIMEOUT_US if frequent.",
-                        request_id,
-                        layer_name,
-                    )
-                    break
-                time.sleep(_backoff)
-                _backoff = min(_backoff * 2, 0.05)
-            with self.moriio_wrapper.lock:
-                self._recving_transfers[request_id][layer_name] = transfer_status
+        with self.moriio_wrapper.lock:
+            for sess_idx, layer_name in enumerate(
+                self.layer_name_to_local_kv_cache_metadata
+            ):
+                self._pending_read_plans[request_id][layer_name] = LayerTransferPlan(
+                    request_id=request_id,
+                    transfer_id=transfer_id,
+                    layer_name=layer_name,
+                    sess_idx=sess_idx,
+                    transfer_local_offsets=offs[0],
+                    transfer_remote_offsets=offs[1],
+                    transfer_sizes=offs[2],
+                    session=sessions[sess_idx],
+                )
+
+        self._dispatch_pending_reads()
