@@ -21,11 +21,6 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 import vllm.model_executor.layers.fused_moe.oracle.fp8 as fp8_oracle
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
-# ---------------------------------------------------------------------------
-# Import the wrapper without requiring the AITER runtime. Importing the module
-# must work even when AITER is not present — it only fails at *kernel-call*
-# time. This is the same pattern as the rest of the vllm aiter modules.
-# ---------------------------------------------------------------------------
 from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (  # noqa: E402
     AiterBatchedExpertsFp8,
     AiterExperts,
@@ -49,8 +44,6 @@ def test_aiter_batched_experts_fp8_activation_format():
 
 
 def test_aiter_batched_experts_does_not_expect_unquantized_inputs():
-    """Critical: ``BatchedExperts`` prepare steps (DeepEP-LL, NIXL) explicitly
-    reject ``defer_input_quant=True``. The wrapper must not request it."""
     # ``expects_unquantized_inputs`` is a @property on the base class, so we
     # have to query an instance, not the class. We don't construct a full
     # ``FusedMoEConfig`` (lots of plumbing) — we just check the descriptor
@@ -181,9 +174,6 @@ def test_select_fp8_moe_backend_routes_batched_aiter_env_to_wrapper(monkeypatch)
 
 
 def test_oracle_priority_order_places_batched_aiter_before_fallbacks():
-    """``BATCHED_AITER`` must be tried before the generic Triton/CUTLASS
-    batched fallbacks on the ROCm path, so the kernel-doesn't-support error
-    is never surfaced when AITER MoE is enabled."""
     # The helper can reshuffle for Hopper/XPU/CPU, but it only needs these
     # fields from the config object for the ROCm/default order we check here.
     moe_config = SimpleNamespace(
