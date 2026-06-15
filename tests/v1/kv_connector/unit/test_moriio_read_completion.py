@@ -10,6 +10,7 @@ import pytest
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     ROLE,
+    LayerTransferPlan,
     MoRIIOConfig,
     MoRIIOMode,
     ReqMeta,
@@ -104,9 +105,16 @@ def make_worker() -> MoRIIOConnectorWorker:
     worker = object.__new__(MoRIIOConnectorWorker)
     worker.is_producer = False
     worker.mode = MoRIIOMode.READ
-    worker.moriio_config = SimpleNamespace(transfer_timeout=1.0, defer_timeout=1.0)
+    worker.moriio_config = SimpleNamespace(
+        transfer_timeout=1.0,
+        defer_timeout=1.0,
+        max_inflight_global=0,
+        max_inflight_per_transfer=0,
+        max_dispatch_layers=0,
+    )
     worker.moriio_wrapper = FakeWrapper()
     worker._recving_transfers = defaultdict(dict)
+    worker._pending_read_plans = defaultdict(dict)
     worker._recving_transfers_callback_addr = {}
     worker._recving_transfer_local_block_ids = {}
     worker._invalid_block_ids = queue.Queue()
@@ -181,6 +189,32 @@ def test_freed_transfer_ids_drop_pending_unmapped_done_tids() -> None:
     assert request_id not in worker._pending_unmapped_done_tids
     assert "other" in worker._pending_unmapped_done_tids
     assert transfer_id not in worker.transfer_id_to_request_id
+
+
+def test_consumer_request_finished_does_not_warn_for_unscheduled_read(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    connector = object.__new__(MoRIIOConnector)
+    connector.is_producer = False
+    connector.transfer_id_to_request_id = {}
+    connector.request_id_to_transfer_id = {}
+    connector._reqs_need_recv = {}
+    request = SimpleNamespace(
+        request_id="tx-00000000-0000-0000-0000-000000000001",
+        status=None,
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "transfer_id": "tx-00000000-0000-0000-0000-000000000001",
+        },
+    )
+
+    with caplog.at_level("WARNING"):
+        delay_free_blocks, kv_params = connector.request_finished(request, [])
+
+    assert delay_free_blocks is False
+    assert kv_params is None
+    assert request.kv_transfer_params["do_remote_prefill"] is False
+    assert "Could not find" not in caplog.text
 
 
 def test_zmq_ctx_sets_keepalive_before_bind_and_connect(
@@ -291,6 +325,41 @@ def test_moriio_config_notify_port_uses_tensor_parallel_size(
     assert config.dp_rank == 2
 
 
+def test_moriio_config_reads_flow_control_extra_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common as common
+
+    monkeypatch.setattr(common, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(common, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(common, "get_ip", lambda: "127.0.0.1")
+    monkeypatch.setattr(common, "get_open_port", lambda: 12345)
+
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={
+                "notify_port": 61005,
+                "proxy_ip": "127.0.0.1",
+                "proxy_ping_port": 36367,
+                "http_port": 8100,
+                "handshake_port": 6301,
+                "handshake_timeout": 120,
+                "max_inflight_global": 16,
+                "max_inflight_per_transfer": 4,
+                "max_dispatch_layers": 4,
+            }
+        ),
+        parallel_config=SimpleNamespace(data_parallel_rank=0, data_parallel_size=1),
+    )
+
+    config = MoRIIOConfig.from_vllm_config(vllm_config)
+
+    assert config.handshake_timeout == 120
+    assert config.max_inflight_global == 16
+    assert config.max_inflight_per_transfer == 4
+    assert config.max_dispatch_layers == 4
+
+
 def test_read_mode_extra_config_overrides_env(monkeypatch: pytest.MonkeyPatch) -> None:
     def make_config(extra_config: dict[str, object]) -> KVTransferConfig:
         return KVTransferConfig(kv_connector_extra_config=extra_config)
@@ -369,6 +438,128 @@ def test_wait_for_layer_load_waits_until_layer_status_succeeds() -> None:
     worker.wait_for_layer_load("layer0")
 
     assert status.succeeded_calls >= 3
+
+
+def test_read_blocks_respects_layer_dispatch_window() -> None:
+    worker = make_worker()
+    worker.moriio_config.max_dispatch_layers = 1
+    worker.tp_rank = 0
+    worker.dp_rank = 0
+    worker.kv_caches = {
+        "layer0": FakeTensor(),
+        "layer1": FakeTensor(),
+        "layer2": FakeTensor(),
+    }
+    worker.layer_name_to_local_kv_cache_metadata = {
+        "layer0": [],
+        "layer1": [],
+        "layer2": [],
+    }
+    worker._get_built_session = lambda _engine_id: (
+        ["session0", "session1", "session2"],
+        SimpleNamespace(num_blocks=1, block_len=1),
+    )
+    worker._compute_block_transfer_offsets = lambda *_args: ([0], [0], [1])
+    worker.moriio_wrapper.read_results = [FakeStatus(), FakeStatus(), FakeStatus()]
+
+    worker._read_blocks(
+        local_block_ids=[11, 12],
+        remote_block_ids=[21, 22],
+        dst_engine_id="remote",
+        request_id="req0",
+        transfer_id="transfer0",
+        remote_host="host",
+        remote_notify_port=61005,
+        remote_dp_rank=0,
+        remote_tp_size=1,
+    )
+
+    assert set(worker._recving_transfers["req0"]) == {"layer0"}
+    assert set(worker._pending_read_plans["req0"]) == {"layer1", "layer2"}
+
+    worker._recving_transfers["req0"]["layer0"].succeeded = True
+    worker.wait_for_layer_load("layer0")
+
+    assert set(worker._recving_transfers["req0"]) == {"layer0", "layer1"}
+    assert set(worker._pending_read_plans["req0"]) == {"layer2"}
+
+
+def test_wait_for_layer_load_dispatches_required_pending_layer() -> None:
+    worker = make_worker()
+    worker.moriio_config.max_dispatch_layers = 1
+    worker.moriio_wrapper.read_results = [FakeStatus(succeeded=True)]
+    worker._recving_transfers_callback_addr["req0"] = ("host", "1234", "transfer0")
+    worker._recving_transfer_local_block_ids["req0"] = {11, 12}
+    worker._pending_read_plans["req0"]["layer1"] = LayerTransferPlan(
+        request_id="req0",
+        transfer_id="transfer0",
+        layer_name="layer1",
+        sess_idx=0,
+        transfer_local_offsets=[0],
+        transfer_remote_offsets=[0],
+        transfer_sizes=[1],
+        session="session0",
+    )
+
+    worker.wait_for_layer_load("layer1")
+
+    assert "layer1" in worker._recving_transfers["req0"]
+    assert "req0" not in worker._pending_read_plans
+
+
+def test_read_blocks_respects_global_active_layer_window() -> None:
+    worker = make_worker()
+    worker.moriio_config.max_inflight_global = 2
+    worker.tp_rank = 0
+    worker.dp_rank = 0
+    worker.kv_caches = {
+        "layer0": FakeTensor(),
+        "layer1": FakeTensor(),
+        "layer2": FakeTensor(),
+    }
+    worker.layer_name_to_local_kv_cache_metadata = {
+        "layer0": [],
+        "layer1": [],
+        "layer2": [],
+    }
+    worker._get_built_session = lambda _engine_id: (
+        ["session0", "session1", "session2"],
+        SimpleNamespace(num_blocks=1, block_len=1),
+    )
+    worker._compute_block_transfer_offsets = lambda *_args: ([0], [0], [1])
+    worker.moriio_wrapper.read_results = [FakeStatus(), FakeStatus()]
+
+    worker._read_blocks(
+        local_block_ids=[11, 12],
+        remote_block_ids=[21, 22],
+        dst_engine_id="remote0",
+        request_id="req0",
+        transfer_id="transfer0",
+        remote_host="host",
+        remote_notify_port=61005,
+        remote_dp_rank=0,
+        remote_tp_size=1,
+    )
+    worker._read_blocks(
+        local_block_ids=[13, 14],
+        remote_block_ids=[23, 24],
+        dst_engine_id="remote1",
+        request_id="req1",
+        transfer_id="transfer1",
+        remote_host="host",
+        remote_notify_port=61005,
+        remote_dp_rank=0,
+        remote_tp_size=1,
+    )
+
+    assert set(worker._recving_transfers["req0"]) == {"layer0", "layer1"}
+    assert "req1" not in worker._recving_transfers
+    assert set(worker._pending_read_plans["req0"]) == {"layer2"}
+    assert set(worker._pending_read_plans["req1"]) == {
+        "layer0",
+        "layer1",
+        "layer2",
+    }
 
 
 def test_wait_for_layer_load_raises_on_failed_status() -> None:

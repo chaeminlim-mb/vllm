@@ -71,6 +71,7 @@ class LayerTransferPlan:
     transfer_local_offsets: list[int]
     transfer_remote_offsets: list[int]
     transfer_sizes: list[int]
+    session: Any
     use_batch: bool = True
 
 
@@ -246,6 +247,19 @@ def _warn_deprecated_env_vars() -> None:
             )
 
 
+def _get_non_negative_int_extra_config(
+    extra_config: dict[str, Any],
+    key: str,
+    default: int,
+) -> int:
+    value = int(extra_config.get(key, default))
+    if value < 0:
+        raise ValueError(
+            f"Invalid MoRIIO {key}={value}; expected a non-negative integer."
+        )
+    return value
+
+
 @dataclass
 class MoRIIOConfig:
     local_ip: str
@@ -269,6 +283,9 @@ class MoRIIOConfig:
     backend: str = "rdma"
     node_hosts: list[str] = field(default_factory=list)
     handshake_timeout: float = 10.0
+    max_inflight_global: int = 0
+    max_inflight_per_transfer: int = 0
+    max_dispatch_layers: int = 0
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> "MoRIIOConfig":
@@ -295,7 +312,6 @@ class MoRIIOConfig:
         #                     (-1 lets the MoRI backend choose).
         # num_workers      -> Number of background worker threads the MoRI
         #                     engine uses for transfer processing.
-
         # TODO : merge notify_port and handshake_port to simplify port management
         #        supports non-contiguous ports
         assert vllm_config.kv_transfer_config is not None, (
@@ -353,6 +369,21 @@ class MoRIIOConfig:
                 extra_config.get(
                     "handshake_timeout", MoRIIOConstants.DEFAULT_HANDSHAKE_TIMEOUT
                 )
+            ),
+            max_inflight_global=_get_non_negative_int_extra_config(
+                extra_config,
+                "max_inflight_global",
+                0,
+            ),
+            max_inflight_per_transfer=_get_non_negative_int_extra_config(
+                extra_config,
+                "max_inflight_per_transfer",
+                0,
+            ),
+            max_dispatch_layers=_get_non_negative_int_extra_config(
+                extra_config,
+                "max_dispatch_layers",
+                0,
             ),
         )
 
