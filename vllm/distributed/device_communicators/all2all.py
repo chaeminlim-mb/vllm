@@ -714,9 +714,9 @@ class MoriAll2AllManager(All2AllManagerBase):
             # multi node
             kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1
             if on_gfx942():
-                warp_num_per_block = 16
-                block_num = 32
-                rdma_block_num = 16
+                warp_num_per_block = 8
+                block_num = 96
+                rdma_block_num = 64
             elif on_gfx950():
                 warp_num_per_block = 8
                 block_num = 64
@@ -745,7 +745,10 @@ class MoriAll2AllManager(All2AllManagerBase):
             # Match SGLang config — vLLM was relying on mori defaults for
             # these two fields, which may not be what mori expects on gfx942.
             num_qp_per_pe=2,
-            quant_type="fp8_direct_cast" if scale_dim > 0 else "none",
+            # use_fp8_dispatch already casts tokens to fp8 in MoriPrepareAndFinalize;
+            # the mori kernel must NOT cast again ("fp8_direct_cast" -> double cast ->
+            # corrupted MoE outputs, ~0.5 GSM8K). Matches milestone3 (fp8-accurate).
+            quant_type="none",
         )
 
     def _make_handle(self, **kwargs):
