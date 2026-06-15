@@ -76,10 +76,6 @@ def _get_priority_backends(
         Fp8MoeBackend.VLLM_CUTLASS,
         Fp8MoeBackend.TRITON,
         Fp8MoeBackend.MARLIN,
-        # Batched (BatchedExperts activation format) variants. BATCHED_AITER
-        # is the ROCm reshape-wrapper around the Standard-layout AITER FP8
-        # kernel; it sits at the top of the batched group so it is selected
-        # ahead of generic Triton / CUTLASS batched fallbacks on gfx942.
         Fp8MoeBackend.BATCHED_AITER,
         Fp8MoeBackend.BATCHED_DEEPGEMM,
         Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
@@ -412,8 +408,6 @@ def select_fp8_moe_backend(
             AVAILABLE_BACKENDS.remove(Fp8MoeBackend.AITER)
             AVAILABLE_BACKENDS.remove(Fp8MoeBackend.BATCHED_AITER)
         else:
-            # For BatchedExperts activation format (multi-node DP/EP via
-            # e.g. DeepEP low-latency), route to the reshape wrapper.
             backend = (
                 Fp8MoeBackend.AITER
                 if activation_format == mk.FusedMoEActivationFormat.Standard
