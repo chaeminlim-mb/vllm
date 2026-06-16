@@ -659,8 +659,8 @@ class AiterBatchedExpertsFp8(mk.FusedMoEExpertsModular):
         )
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
-        # Let the BatchedExperts prepare/finalize (e.g. DeepEP-LL combine)
-        # handle topk weight application + reduction. This matches the
+        # Let the BatchedExperts prepare/finalize handle topk weight
+        # application + reduction. This matches the
         # behavior of every other BatchedExperts implementation in tree
         # (BatchedTritonExperts, CutlassBatchedExpertsFp8, NaiveBatchedExperts).
         return TopKWeightAndReduceDelegate()
