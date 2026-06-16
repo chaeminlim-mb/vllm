@@ -95,9 +95,8 @@ def init_attn_backend(
             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                 layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
 
-            # Split on per-rank num_heads_q so layers with different Q-head
-            # counts (e.g. a spec-decode draft head and its target) get separate
-            # metadata builders.
+            # Metadata builders size per-query-head scratch by this value, so
+            # mixed-head layers (e.g. spec-draft) need separate builders.
             num_heads_q = getattr(attn_layers[layer_name], "num_heads", 0)
             key = (attn_backend.full_cls_name(), layer_kv_cache_spec, num_heads_q)
             if key not in group_map:
