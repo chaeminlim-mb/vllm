@@ -684,14 +684,18 @@ class AiterBatchedExpertsFp8(mk.FusedMoEExpertsModular):
             f"AiterBatchedExpertsFp8 expects 3-D batched hidden_states "
             f"(E_local, M_e, K), got {tuple(hidden_states.shape)}"
         )
-        assert output.dim() == 3, (
-            f"AiterBatchedExpertsFp8 expects 3-D batched output "
-            f"(E_local, M_e, N), got {tuple(output.shape)}"
+        assert output.shape == hidden_states.shape, (
+            f"AiterBatchedExpertsFp8 expects output shape "
+            f"{tuple(hidden_states.shape)}, got {tuple(output.shape)}"
+        )
+        assert output.is_contiguous(), (
+            "AiterBatchedExpertsFp8 expects a contiguous output buffer"
         )
         assert expert_tokens_meta is not None, (
             "AiterBatchedExpertsFp8 requires expert_tokens_meta from the "
             "BatchedExperts prepare step"
         )
+
         # Outer BatchedExperts owns router weighting; inner AITER sees only
         # synthetic all-ones weights.
         E_local, M_e, K = hidden_states.shape
@@ -701,12 +705,15 @@ class AiterBatchedExpertsFp8(mk.FusedMoEExpertsModular):
 
         device = hidden_states.device
 
-        # 1) Flatten activations to (E_local * M_e, K). View-only.
+        # Flatten activations to (E_local * M_e, K). The output buffer must
+        # remain an alias of the runtime-allocated tensor, so flat_out uses
+        # view() after the contiguity check above.
         flat_in = hidden_states.reshape(E_local * M_e, K)
-        flat_out = output.reshape(E_local * M_e, output.size(-1))
+        flat_out = output.view(E_local * M_e, K)
 
         # 2) Build synthetic per-flattened-token routing.
-        # Tokens [i*M_e, (i+1)*M_e) → local expert i.
+        # Tokens [i*M_e, (i+1)*M_e) -> local expert i.
+
         synth_ids = (
             torch.arange(E_local, device=device, dtype=torch.int32)
             .repeat_interleave(M_e)
