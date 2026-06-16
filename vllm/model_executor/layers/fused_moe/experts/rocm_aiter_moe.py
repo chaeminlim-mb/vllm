@@ -539,7 +539,7 @@ class AiterBatchedExpertsFp8(mk.FusedMoEExpertsModular):
     expert ids ``0..E_local-1``, and delegates to the existing Standard-layout
     AITER FP8 kernel.
 
-    The output tensor is provided as ``(E_local, M_e, N)``. A flattened view is
+    The output tensor is provided as ``(E_local, M_e, K)``. A flattened view is
     passed to the inner kernel, so the kernel writes directly into the runtime
     output buffer. Router weights and reduction remain owned by the surrounding
     ``BatchedExperts`` prepare/finalize path.

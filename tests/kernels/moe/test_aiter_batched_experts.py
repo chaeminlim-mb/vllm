@@ -20,12 +20,11 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 import vllm.model_executor.layers.fused_moe.oracle.fp8 as fp8_oracle
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-
-from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (  # noqa: E402
+from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
     AiterBatchedExpertsFp8,
     AiterExperts,
 )
-from vllm.model_executor.layers.fused_moe.oracle.fp8 import (  # noqa: E402
+from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     Fp8MoeBackend,
     _get_priority_backends,
     backend_to_kernel_cls,
