@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import msgpack
 import msgspec
 import numpy as np
+import regex as re
 import torch
 import zmq
 
@@ -25,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     ROLE,
     EngineId,
     HandshakeError,
+    LayerTransferPlan,
     MoRIIOAgentMetadata,
     MoRIIOConfig,
     MoRIIOConnectorMetadata,
@@ -72,6 +74,20 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_TRANSFER_ID_RE = re.compile(
+    r"(tx-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+_MAX_PENDING_UNMAPPED_DONE_TIDS = 4096
+
+_VLLM_REQUEST_SUFFIX_RE = re.compile(r"(.+)-[0-9a-fA-F]{8}$")
+
+
+def _strip_vllm_request_suffix(request_id: str) -> str:
+    match = _VLLM_REQUEST_SUFFIX_RE.fullmatch(request_id)
+    return match.group(1) if match is not None else request_id
+
+
 try:
     from mori.io import (
         BackendType,
@@ -110,6 +126,15 @@ def _pick_remote_rank_host(
         if 0 <= node_idx < n_hosts:
             return remote_hosts[node_idx]
     return default_host
+
+
+def _get_bool_extra_config(extra_config: dict[str, Any], key: str) -> bool:
+    value = extra_config.get(key, False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 class MoRIIOConnector(KVConnectorBase_V1):
@@ -211,6 +236,10 @@ class MoRIIOConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_block_ids_with_load_errors()
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         if self.mode == MoRIIOMode.WRITE and get_role() == ROLE.CONSUMER:
@@ -220,7 +249,12 @@ class MoRIIOConnector(KVConnectorBase_V1):
         self.connector_worker.start_load_kv(self._connector_metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        pass
+        if self.mode != MoRIIOMode.READ or get_role() == ROLE.PRODUCER:
+            return
+        assert self.connector_worker is not None, (
+            "wait_for_layer_load called on scheduler role"
+        )
+        self.connector_worker.wait_for_layer_load(layer_name)
 
     def save_kv_layer(
         self,
@@ -264,6 +298,19 @@ class MoRIIOConnector(KVConnectorBase_V1):
             return self._connector_metadata is not None
         except AttributeError:
             return False
+
+    def get_finished_count(self) -> int | None:
+        # A request's KV transfer spans its TP group, not every DP/EP worker.
+        return self._vllm_config.parallel_config.tensor_parallel_size
+
+    def has_pending_deferred_sends(self) -> bool:
+        if self.connector_scheduler is None:
+            return False
+        return self.connector_scheduler.has_pending_deferred_sends()
+
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        return not _get_bool_extra_config(extra_config, "allow_full_cudagraph")
 
 
 class MoRIIOConnectorScheduler:
@@ -329,15 +376,23 @@ class MoRIIOConnectorScheduler:
                 "defer_timeout", MoRIIOConstants.DEFAULT_DEFER_TIMEOUT
             )
         )
+        self._defer_drain_grace = float(
+            self.kv_transfer_config.kv_connector_extra_config.get(
+                "defer_drain_grace",
+                MoRIIOConstants.DEFAULT_DEFER_DRAIN_GRACE,
+            )
+        )
+        self._deferred_send_drain_until = 0.0
         self.paths: dict[str, zmq.Socket] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
+        self._transfer_ids_to_forget: set[TransferId] = set()
 
     def map_request_id(self, request_id: ReqId, transfer_id: TransferId):
         self.transfer_id_to_request_id[transfer_id] = request_id
         self.request_id_to_transfer_id[request_id] = transfer_id
 
-    def unmap_request_id(self, request_id: ReqId):
+    def unmap_request_id(self, request_id: ReqId, warn_missing: bool = True):
         if request_id in self.request_id_to_transfer_id:
             transfer_id = self.request_id_to_transfer_id[request_id]
             del self.request_id_to_transfer_id[request_id]
@@ -348,7 +403,7 @@ class MoRIIOConnectorScheduler:
                     "transfer id not in transfer_id_to_request_id lookup"
                     "table. there is likely a bug!"
                 )
-        else:
+        elif warn_missing:
             logger.warning(
                 "Could not find %s  in transfer_id_to_request_id"
                 "lookup table.  This could lead to a possible hang.",
@@ -438,13 +493,16 @@ class MoRIIOConnectorScheduler:
                         # a full prefix cache hit on the D worker. We need to call
                         # send_notify in _read_blocks to free the memory on the P.
 
-                        # Get unhashed blocks to pull from remote.
+                        # Get local blocks to pull remote KV into. The two
+                        # block lists must describe the same token span.
+                        # Do not trim here: a mismatch is a target-condition
+                        # bug, not a valid official-regression pass path.
                         local_block_ids = blocks.get_block_ids()[0]
-                        assert len(local_block_ids) <= len(remote_block_ids)
-                        if len(local_block_ids) == len(remote_block_ids):
-                            pass
-                        else:
-                            local_block_ids = remote_block_ids[-len(local_block_ids) :]
+                        assert len(local_block_ids) == len(remote_block_ids), (
+                            "MoRIIO READ block id count mismatch: "
+                            f"local={len(local_block_ids)} "
+                            f"remote={len(remote_block_ids)}"
+                        )
 
                         self._reqs_need_recv[request.request_id] = (
                             request,
@@ -505,6 +563,9 @@ class MoRIIOConnectorScheduler:
     ) -> KVConnectorMetadata:
         meta = MoRIIOConnectorMetadata()
         meta.transfer_id_to_request_id = self.transfer_id_to_request_id
+        if self._transfer_ids_to_forget:
+            meta.freed_transfer_ids = set(self._transfer_ids_to_forget)
+            self._transfer_ids_to_forget.clear()
 
         if self.mode == MoRIIOMode.WRITE:
             # when async_load_kv finished,
@@ -611,15 +672,20 @@ class MoRIIOConnectorScheduler:
         should be freed now or will be sent asynchronously and freed later.
         """
 
+        params = request.kv_transfer_params
         request_id = request.request_id
         # Consumer: can unmap transfer_id<->request_id immediately since done_recving
         #   has fired at this point (i.e. KV has been transferred)
         # Producer: must keep the mapping until we get notification that blocks can
         #   be freed, which may be several scheduler steps later.
         if not self.is_producer:
-            self.unmap_request_id(request_id)
-
-        params = request.kv_transfer_params
+            mapping_was_never_created = bool(
+                params and params.get("do_remote_prefill")
+            )
+            self.unmap_request_id(
+                request_id,
+                warn_missing=not mapping_was_never_created,
+            )
         logger.debug(
             "MoriioConnector request_finished, request_status=%s, "
             "kv_transfer_params=%s",
@@ -657,8 +723,13 @@ class MoRIIOConnectorScheduler:
                 time.perf_counter()
                 + MoRIIOConstants.VLLM_MORI_READ_ABORT_REQUEST_TIMEOUT
             )
+            now = time.monotonic()
             self._deferred_send_deadlines[request.request_id] = (
-                time.monotonic() + self._defer_timeout
+                now + self._defer_timeout
+            )
+            self._deferred_send_drain_until = max(
+                self._deferred_send_drain_until,
+                now + self._defer_drain_grace,
             )
 
         # Return KV transfer params forwarded verbatim to the decode instance by
@@ -669,11 +740,16 @@ class MoRIIOConnectorScheduler:
             remote_block_ids=computed_block_ids,
             remote_engine_id=self.engine_id,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+            remote_dp_size=self.vllm_config.parallel_config.data_parallel_size,
             transfer_id=params["transfer_id"],
             # Multi-node TP: list of all prefill-instance host IPs in this
             # engine's TP group (rank 0 first). Decode workers use this to
             # pick the correct producer host per their tp_rank.
             remote_hosts=self.node_hosts,
+            # Wall-clock TS captured at end of P-side prefill (request_finished
+            # runs after FINISHED_LENGTH_CAPPED). Consumed by D's OutputProcessor
+            # to derive stage-3 KV transfer time. Requires NTP sync across nodes.
+            prefill_complete_ts=time.time(),
         )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
@@ -692,6 +768,9 @@ class MoRIIOConnectorScheduler:
         # Consumer: unmapping already done in request_finished
         if self.is_producer and connector_output.finished_sending:
             for req_id in connector_output.finished_sending:
+                transfer_id = self.request_id_to_transfer_id.get(req_id)
+                if transfer_id is not None:
+                    self._transfer_ids_to_forget.add(transfer_id)
                 self.unmap_request_id(req_id)
 
         if not self._deferred_send_deadlines:
@@ -701,6 +780,10 @@ class MoRIIOConnectorScheduler:
         # freed anyways.
         for req_id in connector_output.finished_sending or ():
             self._deferred_send_deadlines.pop(req_id, None)
+
+        if not self._deferred_send_deadlines:
+            self._deferred_send_drain_until = 0.0
+            return
 
         now = time.monotonic()
         expired_reqs = [
@@ -715,16 +798,31 @@ class MoRIIOConnectorScheduler:
             connector_output.finished_sending = set()
         # Register the expired requests as finished so the scheduler frees their blocks.
         for req_id in expired_reqs:
+            transfer_id = self.request_id_to_transfer_id.get(req_id)
+            if transfer_id is not None:
+                self._transfer_ids_to_forget.add(transfer_id)
             connector_output.finished_sending.add(req_id)
             del self._deferred_send_deadlines[req_id]
             if self.is_producer:
                 self.unmap_request_id(req_id)
+        if not self._deferred_send_deadlines:
+            self._deferred_send_drain_until = 0.0
         logger.warning(
             "Reaped %d deferred sends with no finished_sending notification "
             "after %.0fs. This indicates lost async KV completion "
             "notifications from the KV connector.",
             len(expired_reqs),
             self._defer_timeout,
+        )
+
+    def has_pending_deferred_sends(self) -> bool:
+        if self._transfer_ids_to_forget:
+            return True
+        if not self._deferred_send_deadlines:
+            return False
+        now = time.monotonic()
+        return now < self._deferred_send_drain_until or any(
+            now >= deadline for deadline in self._deferred_send_deadlines.values()
         )
 
 
@@ -738,7 +836,11 @@ class MoRIIOConnectorWorker:
                 "is installed and properly configured."
             )
 
-        assert vllm_config.kv_transfer_config is not None
+        assert vllm_config.kv_transfer_config is not None, (
+            "kv_transfer_config must be set for MoRIIOConnector"
+        )
+        self.vllm_config = vllm_config
+        self.kv_transfer_config = vllm_config.kv_transfer_config
         self.moriio_config = MoRIIOConfig.from_vllm_config(vllm_config)
         self.mode = (
             MoRIIOMode.READ if self.moriio_config.read_mode else MoRIIOMode.WRITE
@@ -749,11 +851,6 @@ class MoRIIOConnectorWorker:
         logging.getLogger("aiter").disabled = True
 
         # Config.
-        self.vllm_config = vllm_config
-        assert vllm_config.kv_transfer_config is not None, (
-            "kv_transfer_config must be set for MoRIIOConnector"
-        )
-        self.kv_transfer_config = vllm_config.kv_transfer_config
         self.is_producer = self.kv_transfer_config.is_kv_producer
 
         if self.is_producer:
@@ -765,6 +862,7 @@ class MoRIIOConnectorWorker:
         self._local_rank = get_world_group().local_rank
         self.tp_rank = self.moriio_config.tp_rank
         self.dp_rank = self.moriio_config.dp_rank
+        self.tp_size = self.moriio_config.tp_size
 
         self.local_ip = self.moriio_config.local_ip
         self.local_kv_port = self.moriio_config.local_kv_port
@@ -775,6 +873,8 @@ class MoRIIOConnectorWorker:
         self.handshake_port = self.moriio_config.handshake_port
         self.notify_port = self.moriio_config.notify_port
         self.node_hosts = self.moriio_config.node_hosts
+
+        self.dp_rank_to_host: dict[int, str] = {}
 
         self.zmq_context = zmq.Context()
         self.metadata_address = (
@@ -864,7 +964,7 @@ class MoRIIOConnectorWorker:
 
         self.side_channel_port: int = (
             self.moriio_config.handshake_port
-            + get_port_offset(self.dp_rank, self.tp_rank)
+            + get_port_offset(self.dp_rank, self.tp_rank, self.tp_size)
         )
         self.engine_id: EngineId = engine_id
 
@@ -886,10 +986,15 @@ class MoRIIOConnectorWorker:
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
         self.dst_num_blocks: dict[EngineId, int] = {}
-        # In progress transfers.
-        self._recving_transfers: defaultdict[ReqId, list] = defaultdict(list)
+        # In-progress READ transfers: per request, keyed by layer name.
+        self._recving_transfers: defaultdict[ReqId, dict[str, Any]] = defaultdict(dict)
+        self._pending_read_plans: defaultdict[
+            ReqId, dict[str, LayerTransferPlan]
+        ] = defaultdict(dict)
         # Values are (remote_host, remote_notify_port, transfer_id).
         self._recving_transfers_callback_addr: dict[ReqId, tuple[str, str, str]] = {}
+        self._recving_transfer_local_block_ids: dict[ReqId, set[int]] = {}
+        self._invalid_block_ids: queue.Queue[set[int]] = queue.Queue()
 
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
@@ -906,6 +1011,11 @@ class MoRIIOConnectorWorker:
         self._handshake_futures: dict[EngineId, Future[set[str]]] = {}
         # Protects _handshake_futures and _remote_agents.
         self._handshake_lock = threading.RLock()
+        # Base remote engines ("host:handshake_port") whose full DP-rank set has
+        # been eagerly handshaked AND TP-barriered. Gates
+        # _eager_handshake_all_dp_ranks to fire once per remote engine (first
+        # contact), not per request/step.
+        self._eager_handshaked_engines: set[str] = set()
 
         self.block_size = vllm_config.cache_config.block_size
         self.model_config = vllm_config.model_config
@@ -922,10 +1032,113 @@ class MoRIIOConnectorWorker:
             use_mla=self.use_mla,
         )
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
+        self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
+        # READ-mode producer: buffer completion ids whose decode-side notify
+        # arrived BEFORE start_load_kv populated transfer_id_to_request_id.
+        # Without this, get_finished() drops the notification → scheduler
+        # never marks the request done_sending → producer KV blocks leak.
+        # Retry on every get_finished call until mapping is populated. The
+        # normal id is transfer_id, but older paths may deliver a wrapped
+        # transfer id or request id. Keep insertion order so malformed
+        # notifications are evicted oldest-first at the cap.
+        self._pending_unmapped_done_tids: dict[str, None] = {}
 
         # TODO: consider the integration of flashinfer or other backends.
         self.backend_name = backend.get_name()
         logger.debug("Detected attention backend %s", self.backend_name)
+
+    def _remember_transfer_mapping(
+        self, transfer_id: TransferId, request_id: ReqId
+    ) -> None:
+        self.transfer_id_to_request_id[transfer_id] = request_id
+        self.request_id_to_transfer_id[request_id] = transfer_id
+        external_request_id = _strip_vllm_request_suffix(request_id)
+        if external_request_id != request_id:
+            self.request_id_to_transfer_id.setdefault(external_request_id, transfer_id)
+
+    def _forget_transfer_mapping(
+        self, transfer_id: TransferId, request_id: ReqId | None = None
+    ) -> None:
+        if request_id is None:
+            request_id = self.transfer_id_to_request_id.get(transfer_id)
+        self.transfer_id_to_request_id.pop(transfer_id, None)
+        if request_id is None:
+            return
+        self.request_id_to_transfer_id.pop(request_id, None)
+        external_request_id = _strip_vllm_request_suffix(request_id)
+        if external_request_id != request_id:
+            mapped_transfer_id = self.request_id_to_transfer_id.get(external_request_id)
+            if mapped_transfer_id == transfer_id:
+                self.request_id_to_transfer_id.pop(external_request_id, None)
+
+    def _drop_pending_unmapped_done_tid(
+        self, transfer_id: TransferId, request_id: ReqId | None = None
+    ) -> None:
+        ids_to_drop = {transfer_id}
+        if request_id is not None:
+            ids_to_drop.add(request_id)
+            ids_to_drop.add(_strip_vllm_request_suffix(request_id))
+
+        for completion_id in list(self._pending_unmapped_done_tids):
+            if completion_id in ids_to_drop:
+                self._pending_unmapped_done_tids.pop(completion_id, None)
+                continue
+            match = _TRANSFER_ID_RE.search(completion_id)
+            if match is not None and match.group(1) == transfer_id:
+                self._pending_unmapped_done_tids.pop(completion_id, None)
+
+    def _buffer_pending_unmapped_done_tid(self, completion_id: str) -> None:
+        if completion_id in self._pending_unmapped_done_tids:
+            return
+        if len(self._pending_unmapped_done_tids) >= _MAX_PENDING_UNMAPPED_DONE_TIDS:
+            oldest = next(iter(self._pending_unmapped_done_tids))
+            self._pending_unmapped_done_tids.pop(oldest, None)
+            logger.warning(
+                "Dropping oldest pending READ completion id after buffer "
+                "reached %d entries",
+                _MAX_PENDING_UNMAPPED_DONE_TIDS,
+            )
+        self._pending_unmapped_done_tids[completion_id] = None
+
+    def _translate_or_buffer_read_completion(
+        self, completion_id: str, done_sending: set[str]
+    ) -> None:
+        mapped = self._pop_mapped_completion_id(completion_id)
+        if mapped is not None:
+            done_sending.add(mapped)
+        else:
+            # Mapping not yet populated — keep pending, retry next tick.
+            # Without this buffer the notification is lost and the producer's
+            # KV blocks leak.
+            self._buffer_pending_unmapped_done_tid(completion_id)
+
+    def _pop_mapped_completion_id(self, completion_id: str) -> ReqId | None:
+        request_id = self.transfer_id_to_request_id.get(completion_id)
+        if request_id is not None:
+            self._forget_transfer_mapping(completion_id, request_id)
+            return request_id
+
+        match = _TRANSFER_ID_RE.search(completion_id)
+        if match is not None:
+            transfer_id = match.group(1)
+            request_id = self.transfer_id_to_request_id.get(transfer_id)
+            if request_id is not None:
+                self._forget_transfer_mapping(transfer_id, request_id)
+                return request_id
+
+        transfer_id = self.request_id_to_transfer_id.get(completion_id)
+        if transfer_id is None:
+            transfer_id = self.request_id_to_transfer_id.get(
+                _strip_vllm_request_suffix(completion_id)
+            )
+        if transfer_id is None:
+            return None
+        request_id = self.transfer_id_to_request_id.get(transfer_id)
+        if request_id is None:
+            self.request_id_to_transfer_id.pop(completion_id, None)
+            return None
+        self._forget_transfer_mapping(transfer_id, request_id)
+        return request_id
 
     def schedule_write_blocks(
         self,
@@ -1137,6 +1350,22 @@ class MoRIIOConnectorWorker:
                         req_id.decode(),
                     )
 
+    def _remote_tp_rank(self, remote_tp_size: int) -> int:
+        """Map this local TP rank onto the remote engine's TP layout for port
+        addressing. WHICH remote DP rank to read is chosen separately by the
+        per-request remote_dp_rank (the single prefill rank that holds this
+        request's KV); this only resolves the remote TP index.
+
+        The remote TP width may differ from ours (e.g. TP1/DP8 prefill ↔ TP8
+        decode). When the remote is TP1 (remote_tp_size == 1) there is a single
+        rank per DP group, so every local rank must target tp0 — modulo gives 0.
+        When TP sizes are equal, modulo is the identity (tp_rank), preserving
+        symmetric-TP behaviour exactly. For the wider-remote mirror (TP8 prefill
+        ↔ TP1 decode), MLA replicates the latent KV across the remote TP ranks,
+        so collapsing onto a valid remote rank still yields the full KV.
+        """
+        return self.tp_rank % max(1, int(remote_tp_size))
+
     def _moriio_handshake(
         self,
         host: str,
@@ -1153,15 +1382,36 @@ class MoRIIOConnectorWorker:
         # a hack to keep us moving. We will switch when moving to etcd
         # or where we have a single ZMQ socket in the scheduler.
 
-        port_offset = get_port_offset(remote_dp_rank, self.tp_rank)
+        # Heterogeneous-TP port mapping: dial the remote's TP index, not our own
+        # local tp_rank. For TP1/DP8 prefill ↔ TP8 decode this collapses every
+        # decode rank onto the prefill rank's tp0 (remote_dp_rank picks the DP
+        # rank). Identity for symmetric TP. See _remote_tp_rank.
+        port_offset = get_port_offset(
+            remote_dp_rank, self._remote_tp_rank(remote_tp_size), remote_tp_size
+        )
         path = make_zmq_path("tcp", host, port + port_offset)
         logger.debug("handshake Querying metadata on path: %s", path)
 
         # Send query for the request.
+        timeout_ms = int(self.moriio_config.handshake_timeout * 1000)
         with zmq_ctx(zmq.DEALER, path) as sock:
+            # Bound the handshake so a dead/slow remote listener fails fast
+            # (HandshakeError) instead of blocking this TP worker forever on
+            # recv() and desyncing the TP collective. LINGER=0 discards a
+            # timed-out socket cleanly without a half-sent reply.
+            sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
+            sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
+            sock.setsockopt(zmq.LINGER, 0)
             logger.debug("prepare send msg INSTAZNCE: %s", path)
             sock.send(MoRIIOConstants.GET_META_MSG)
-            received_frame = sock.recv_multipart()
+            try:
+                received_frame = sock.recv_multipart()
+            except zmq.error.Again as e:
+                raise HandshakeError(
+                    f"MoRIIO handshake metadata recv timed out after "
+                    f"{timeout_ms}ms on path {path} (remote dp rank "
+                    f"{remote_dp_rank}); remote handshake listener unreachable"
+                ) from e
             if len(received_frame) != 2 or received_frame[0] != b"":
                 raise HandshakeError(f"Unexpected frame! {received_frame = }")
 
@@ -1178,6 +1428,7 @@ class MoRIIOConnectorWorker:
             remote_agent_name = self.moriio_wrapper.register_remote_engine(
                 metadata.agent_metadata
             )
+            self.dp_rank_to_host[int(remote_dp_rank)] = host
 
             logger.debug(
                 "MoRIIO handshake: registered"
@@ -1202,7 +1453,14 @@ class MoRIIOConnectorWorker:
                 )
                 self.remote_kv_cache_metadata = []
 
-            received_frame = sock.recv_multipart()
+            try:
+                received_frame = sock.recv_multipart()
+            except zmq.error.Again as e:
+                raise HandshakeError(
+                    f"MoRIIO handshake layer-metadata recv timed out after "
+                    f"{timeout_ms}ms on path {path} (remote dp rank "
+                    f"{remote_dp_rank})"
+                ) from e
             if len(received_frame) != 2 or received_frame[0] != b"":
                 raise HandshakeError(f"unexpected frame! {received_frame = }")
             buf = received_frame[1]
@@ -1403,17 +1661,51 @@ class MoRIIOConnectorWorker:
         to track which workers are done.
         """
 
-        done_sending, done_recving = set(), set()
+        done_sending: set[str] = set()
+        done_recving: set[str] = set()
 
         if self.is_producer:
-            # pop_finished_req_ids returns transfer_ids (the ZMQ payload sent
-            # by decode via send_notify); map back to req_ids for the scheduler.
-            finished_transfer_ids = self.moriio_wrapper.pop_finished_req_ids()
-            done_sending = {
-                self.transfer_id_to_request_id[xfer_id]
-                for xfer_id in finished_transfer_ids
-                if xfer_id in self.transfer_id_to_request_id
-            }
+            done_sending_raw = self.moriio_wrapper.pop_finished_req_ids()
+            if self.mode == MoRIIOMode.READ:
+                # READ mode: the consumer (decode) notifies the producer
+                # (prefill) over ZMQ once it finishes the RDMA read. The
+                # notification carries the transfer_id (not the consumer's
+                # internal request_id) because each engine independently
+                # appends a random 8-char suffix to its request_id in
+                # InputProcessor.assign_request_id, so the consumer's and
+                # producer's internal request_ids for the same logical
+                # request differ. Translate back to the producer's own
+                # internal request_id via transfer_id_to_request_id (which
+                # was populated at scheduling time by update_state_after_alloc
+                # and synced to the worker by start_load_kv). Pop on success
+                # to keep the persistent worker map bounded.
+                # Combine newly-arrived done tids with tids buffered from
+                # prior calls whose mapping wasn't populated yet by
+                # start_load_kv. Retry the lookup on every call; once the
+                # scheduler→worker sync runs, the mapping appears and the
+                # request gets marked done_sending so its KV blocks free.
+                # This race-buffer subsumes the simpler dict-membership
+                # filter introduced by #40344 — if the mapping is missing
+                # we now retry rather than drop the notification.
+                pending_tids = self._pending_unmapped_done_tids
+                self._pending_unmapped_done_tids = {}
+                for tid in pending_tids:
+                    self._translate_or_buffer_read_completion(tid, done_sending)
+                for tid in done_sending_raw:
+                    if tid in pending_tids:
+                        continue
+                    self._translate_or_buffer_read_completion(tid, done_sending)
+                if self._pending_unmapped_done_tids:
+                    logger.debug(
+                        "get_finished (producer READ): %d tid(s) "
+                        "pending mapping (race vs start_load_kv)",
+                        len(self._pending_unmapped_done_tids),
+                    )
+            else:
+                # WRITE mode: producer locally appends its own internal
+                # request_id to done_req_ids in _finalize_if_complete, so no
+                # translation is required.
+                done_sending = done_sending_raw
         else:
             if self.mode == MoRIIOMode.WRITE:
                 fresh = self.moriio_wrapper.pop_finished_write_req_ids()
@@ -1431,59 +1723,336 @@ class MoRIIOConnectorWorker:
                 # expect a finished_recving signal for RUNNING requests.
                 self._pop_done_transfers()
 
-        done_recving = {
-            self.transfer_id_to_request_id[id]
-            for id in filter(
-                lambda id: id in self.transfer_id_to_request_id, done_recving
-            )
-        }
+        # Translate consumer-side done_recving (transfer_ids reported by the
+        # producer via send_notify in WRITE mode) back to the consumer's own
+        # internal request_ids. Pop on success so the persistent worker map
+        # (populated incrementally in start_load_kv) does not grow unbounded.
+        translated_recving: set[str] = set()
+        matched_xfer_ids: set[str] = set()
+        for tid in done_recving:
+            mapped = self._pop_mapped_completion_id(tid)
+            if mapped is not None:
+                translated_recving.add(mapped)
+                matched_xfer_ids.add(tid)
+        done_recving = translated_recving
+
         if self.mode == MoRIIOMode.WRITE and not self.is_producer:
-            # Remove the ones we successfully matched; leave unmatched for retry.
-            matched_xfer_ids = {
-                id
-                for id in self._unmatched_write_completions
-                if id in self.transfer_id_to_request_id
-            }
             self._unmatched_write_completions -= matched_xfer_ids
 
         return done_sending, done_recving
 
+    def _handle_failed_read_transfer_locked(
+        self,
+        req_id: ReqId,
+        failed_status=None,
+        error: Exception | None = None,
+        record_invalid_blocks: bool = True,
+    ) -> None:
+        if failed_status is not None:
+            message = failed_status.Message()
+            code = failed_status.Code()
+        else:
+            message = str(error)
+            code = "setup"
+        invalid_block_ids = self._recving_transfer_local_block_ids.get(req_id, set())
+        if record_invalid_blocks and invalid_block_ids:
+            self._invalid_block_ids.put(set(invalid_block_ids))
+            self._recving_transfer_local_block_ids[req_id] = set()
+        logger.error(
+            "RDMA transfer failed for request %s: %s (code=%s). Notifying "
+            "prefill to free blocks%s.",
+            req_id,
+            message,
+            code,
+            " and marking local blocks invalid" if record_invalid_blocks else "",
+        )
+        callback_addr = self._recving_transfers_callback_addr.get(req_id)
+        if callback_addr is not None:
+            host, port, xfer_id = callback_addr
+            try:
+                self.moriio_wrapper.send_notify(xfer_id, host, port)
+            except Exception:
+                logger.exception(
+                    "Failed to send error notification for request %s; will retry",
+                    req_id,
+                )
+                return
+            self._forget_transfer_mapping(xfer_id, req_id)
+        else:
+            logger.warning(
+                "No READ completion callback address for failed request %s",
+                req_id,
+            )
+        self._recving_transfers.pop(req_id, None)
+        self._pending_read_plans.pop(req_id, None)
+        self._recving_transfers_callback_addr.pop(req_id, None)
+        self._recving_transfer_local_block_ids.pop(req_id, None)
+
+    @staticmethod
+    def _is_sq_full_status(status) -> bool:
+        """True if a MoRIIO transfer status is a transient RDMA send-queue-full
+        rejection (retryable backpressure), not a terminal failure.
+
+        The mori RDMA backend posts synchronously (the executor joins its worker
+        before returning — executor.cpp:174-183 — and marks the status on the
+        calling thread, backend_impl.cpp:1007), so an SQ-full rejection is a
+        Failed() status the moment batch_read() returns. mori surfaces it as a
+        generic ERR_RDMA_OP carrying "SQ full" in the message (no distinct code),
+        so we match the message. Only meaningful once status.Failed() is True.
+        """
+        try:
+            return bool(status.Failed()) and "SQ full" in (status.Message() or "")
+        except Exception:
+            return False
+
+    @staticmethod
+    def _read_status_active(status) -> bool:
+        return not status.Succeeded() and not status.Failed()
+
+    def _active_read_layer_count_locked(self) -> int:
+        return sum(
+            1
+            for status_by_layer in self._recving_transfers.values()
+            for status in status_by_layer.values()
+            if self._read_status_active(status)
+        )
+
+    def _active_read_layers_for_req_locked(self, req_id: ReqId) -> int:
+        status_by_layer = self._recving_transfers.get(req_id, {})
+        return sum(
+            1
+            for status in status_by_layer.values()
+            if self._read_status_active(status)
+        )
+
+    def _per_transfer_read_cap(self) -> int:
+        caps = [
+            cap
+            for cap in (
+                self.moriio_config.max_inflight_per_transfer,
+                self.moriio_config.max_dispatch_layers,
+            )
+            if cap > 0
+        ]
+        return min(caps) if caps else 0
+
+    def _can_dispatch_read_plan_locked(self, req_id: ReqId) -> bool:
+        active_layers = self._active_read_layers_for_req_locked(req_id)
+        per_transfer_cap = self._per_transfer_read_cap()
+        if per_transfer_cap > 0 and active_layers >= per_transfer_cap:
+            return False
+
+        global_cap = self.moriio_config.max_inflight_global
+        return global_cap <= 0 or self._active_read_layer_count_locked() < global_cap
+
+    def _take_dispatchable_read_plan(
+        self, layer_name: str | None = None
+    ) -> LayerTransferPlan | None:
+        with self.moriio_wrapper.lock:
+            for req_id, plans_by_layer in list(self._pending_read_plans.items()):
+                if layer_name is None:
+                    if not plans_by_layer:
+                        continue
+                    plan_layer_name = next(iter(plans_by_layer))
+                else:
+                    if layer_name not in plans_by_layer:
+                        continue
+                    plan_layer_name = layer_name
+
+                if not self._can_dispatch_read_plan_locked(req_id):
+                    continue
+
+                plan = plans_by_layer.pop(plan_layer_name)
+                if not plans_by_layer:
+                    self._pending_read_plans.pop(req_id, None)
+                return plan
+
+        return None
+
+    def _post_read_plan(self, plan: LayerTransferPlan) -> None:
+        _sq_deadline = time.monotonic() + self.moriio_config.transfer_timeout
+        _backoff = 0.001
+        while True:
+            try:
+                transfer_status = self.moriio_wrapper.read_remote_data(
+                    plan.transfer_sizes,
+                    plan.transfer_local_offsets,
+                    plan.transfer_remote_offsets,
+                    plan.session,
+                )
+            except Exception as e:
+                with self.moriio_wrapper.lock:
+                    has_partial_status = bool(
+                        self._recving_transfers.get(plan.request_id)
+                    )
+                    self._handle_failed_read_transfer_locked(
+                        plan.request_id,
+                        error=e,
+                        record_invalid_blocks=has_partial_status,
+                    )
+                raise
+            if not self._is_sq_full_status(transfer_status):
+                break
+            if time.monotonic() > _sq_deadline:
+                logger.warning(
+                    "MoRIIO READ send queue stayed full past transfer_timeout "
+                    "for req %s layer %s; storing failed status (handled "
+                    "non-fatally in wait_for_layer_load). Raise "
+                    "VLLM_MORIIO_QP_PER_TRANSFER and/or "
+                    "MORI_IO_SQ_BACKOFF_TIMEOUT_US if frequent.",
+                    plan.request_id,
+                    plan.layer_name,
+                )
+                break
+            time.sleep(_backoff)
+            _backoff = min(_backoff * 2, 0.05)
+
+        with self.moriio_wrapper.lock:
+            self._recving_transfers[plan.request_id][plan.layer_name] = (
+                transfer_status
+            )
+
+    def _dispatch_pending_reads(self, layer_name: str | None = None) -> None:
+        while True:
+            plan = self._take_dispatchable_read_plan(layer_name)
+            if plan is None:
+                return
+            self._post_read_plan(plan)
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if self.is_producer or self.mode != MoRIIOMode.READ:
+            return
+
+        deadline = time.monotonic() + self.moriio_config.transfer_timeout
+        while True:
+            self._dispatch_pending_reads(layer_name)
+
+            with self.moriio_wrapper.lock:
+                pending_plan_req_ids = {
+                    req_id
+                    for req_id, plans_by_layer in self._pending_read_plans.items()
+                    if layer_name in plans_by_layer
+                }
+                pending = [
+                    (req_id, status_by_layer[layer_name])
+                    for req_id, status_by_layer in self._recving_transfers.items()
+                    if layer_name in status_by_layer
+                ]
+
+            if not pending and not pending_plan_req_ids:
+                return
+
+            still_running = False
+            for req_id, status in pending:
+                if status.Succeeded():
+                    continue
+                if status.Failed():
+                    with self.moriio_wrapper.lock:
+                        self._handle_failed_read_transfer_locked(req_id, status)
+                    if self._is_sq_full_status(status):
+                        # SQ-full that survived the post-site backoff (sustained
+                        # saturation past transfer_timeout). Fail only THIS
+                        # request — blocks already marked invalid + prefill
+                        # notified above — instead of raising and killing the
+                        # worker/EngineCore. A multi-decode/MTP RDMA overload
+                        # must NOT take down the engine. The request was popped
+                        # from _recving_transfers, so re-evaluate pending.
+                        logger.warning(
+                            "MoRIIO READ send queue still full for req %s "
+                            "layer %s after transfer_timeout; failed this "
+                            "request (worker stays alive). Raise "
+                            "VLLM_MORIIO_QP_PER_TRANSFER and/or "
+                            "MORI_IO_SQ_BACKOFF_TIMEOUT_US if frequent.",
+                            req_id,
+                            layer_name,
+                        )
+                        continue
+                    raise RuntimeError(
+                        "MoRIIO READ transfer failed for "
+                        f"request {req_id}, layer {layer_name}: "
+                        f"{status.Message()} (code={status.Code()})"
+                    )
+                still_running = True
+
+            if not still_running and not pending_plan_req_ids:
+                self._dispatch_pending_reads()
+                return
+
+            if time.monotonic() > deadline:
+                error = TimeoutError(
+                    "Timed out waiting for MoRIIO READ transfer for "
+                    f"layer {layer_name}; adjust with "
+                    "kv_connector_extra_config.transfer_timeout"
+                )
+                with self.moriio_wrapper.lock:
+                    req_ids = {req_id for req_id, _status in pending}
+                    req_ids.update(pending_plan_req_ids)
+                    for req_id in req_ids:
+                        self._handle_failed_read_transfer_locked(req_id, error=error)
+                raise error
+
+            time.sleep(0.001)
+
     def _pop_done_transfers(self) -> set[str]:
-        done_req_ids: set[str] = set()
+        """Pop completed remote-read transfers and notify the producer.
+
+        Sends the transfer_id (not the consumer's internal request_id) so the
+        producer can translate it back to its own internal request_id; see
+        get_finished() for the producer-side translation and the assign_request_id
+        rationale.
+
+        Returns an empty set because in READ mode the consumer scheduler does
+        not track recv-completion (get_num_new_matched_tokens returns
+        async=False, so requests never enter WAITING_FOR_REMOTE_KVS); reporting
+        a recv-completion here would trip the scheduler assertion at
+        _update_from_kv_xfer_finished. The downstream translation block in
+        get_finished() therefore receives an empty set and is a no-op.
+        """
         with self.moriio_wrapper.lock:
             to_remove = []
-            for req_id, status_list in self._recving_transfers.items():
-                last = status_list[-1]
-                if last.Succeeded():
-                    host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
-                    done_req_ids.add(xfer_id)
-                    self.moriio_wrapper.send_notify(xfer_id, host, port)
-                    to_remove.append(req_id)
-                elif last.Failed():
-                    logger.error(
-                        "RDMA transfer failed for request %s: %s (code=%s). "
-                        "Notifying prefill to free blocks; request will be "
-                        "aborted by timeout.",
-                        req_id,
-                        last.Message(),
-                        last.Code(),
-                    )
+            for req_id, status_by_layer in list(self._recving_transfers.items()):
+                statuses = list(status_by_layer.values())
+                failed_status = next(
+                    (status for status in statuses if status.Failed()), None
+                )
+                if (
+                    statuses
+                    and req_id not in self._pending_read_plans
+                    and all(status.Succeeded() for status in statuses)
+                ):
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     try:
                         self.moriio_wrapper.send_notify(xfer_id, host, port)
                     except Exception:
                         logger.exception(
-                            "Failed to send error notification for request %s",
+                            "MoRIIO READ completion notify failed for "
+                            "request %s transfer %s; will retry",
                             req_id,
+                            xfer_id,
                         )
+                        continue
+                    self._forget_transfer_mapping(xfer_id, req_id)
                     to_remove.append(req_id)
+                elif failed_status is not None:
+                    self._handle_failed_read_transfer_locked(req_id, failed_status)
                     # Do NOT add to done_req_ids: decode KV cache is incomplete.
                     # The request will expire via the normal request timeout.
             for req_id in to_remove:
-                del self._recving_transfers[req_id]
-                del self._recving_transfers_callback_addr[req_id]
+                self._recving_transfers.pop(req_id, None)
+                self._pending_read_plans.pop(req_id, None)
+                self._recving_transfers_callback_addr.pop(req_id, None)
+                self._recving_transfer_local_block_ids.pop(req_id, None)
 
-            return done_req_ids
+            return set()
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        result: set[int] = set()
+        while not self._invalid_block_ids.empty():
+            try:
+                result.update(self._invalid_block_ids.get_nowait())
+            except queue.Empty:
+                break
+        return result
 
     def save_kv_layer(
         self,
@@ -1500,18 +2069,20 @@ class MoRIIOConnectorWorker:
         remote_engine_id = None
 
         for req_id, meta in metadata.reqs_to_save.items():
-            # we only need to check if dp0 in rank
+            # Gate on the DP rank that owns the remote allocation.
             remote_engine_id = (
                 str(meta.remote_host) + ":" + str(meta.remote_handshake_port)
             )
 
             meta.remote_engine_id = remote_engine_id
 
-            dp0_remote_engine_id = self.get_engine_name_with_dp(remote_engine_id, 0)
-            if dp0_remote_engine_id not in self._remote_agents:
+            target_remote_engine_id = self.get_engine_name_with_dp(
+                remote_engine_id, int(meta.remote_dp_rank)
+            )
+            if target_remote_engine_id not in self._remote_agents:
                 # Initiate handshake with remote engine to exchange metadata.
                 with self._handshake_lock:
-                    if remote_engine_id not in self._remote_agents:
+                    if target_remote_engine_id not in self._remote_agents:
                         self._background_moriio_handshake(
                             req_id, remote_engine_id, meta
                         )
@@ -1549,17 +2120,151 @@ class MoRIIOConnectorWorker:
     def get_engine_name_with_dp(self, engine_name, dp_rank):
         return f"{engine_name}_dp{dp_rank}"
 
+    def _eager_handshake_all_dp_ranks(
+        self, metadata: MoRIIOConnectorMetadata
+    ) -> None:
+        """Eagerly handshake EVERY remote prefill DP rank, identically across
+        all local TP workers, before any KV read enters the forward path.
+
+        Why: the decode forward issues per-layer TP collectives (e.g.
+        _ALLGATHER_BASE). A lazy/per-request/per-rank handshake on the read path
+        (see _ensure_remote_dp_handshaked) lets TP workers diverge — a rank
+        whose target was already cached races ahead into the forward collective
+        while another rank blocks on a handshake recv() → 600s NCCL timeout.
+
+        This fires ONCE per remote engine (first contact), gated by
+        self._eager_handshaked_engines. The engine set is derived purely from
+        scheduler-built metadata (identical on every TP worker), so all workers
+        run the same handshakes in the same order and reach the TP all-reduce
+        below together. After it returns, every dp rank is in _remote_agents /
+        layer_name_to_remote_kv_cache_metadata, so the existing read loop is a
+        pure cache hit and _ensure_remote_dp_handshaked is a no-op.
+
+        Failure: handshake exceptions are caught (never raised before the
+        collective — that would hang the other ranks). All workers reach the
+        all-reduce(MIN) vote; if ANY worker failed, ALL raise the same error
+        AFTER the collective, so the step fails fast and uniformly in ~seconds
+        instead of one rank hanging the TP forward for 600s.
+        """
+        import torch.distributed as dist
+
+        # Distinct remote engines referenced this step, in metadata (==
+        # scheduler) order so every TP worker iterates engines identically.
+        engines: dict[str, ReqMeta] = {}
+        for _req_id, meta in metadata.reqs_to_recv.items():
+            remote_engine_id = (
+                str(meta.remote_host) + ":" + str(meta.remote_handshake_port)
+            )
+            engines.setdefault(remote_engine_id, meta)
+
+        for remote_engine_id, meta in engines.items():
+            if remote_engine_id in self._eager_handshaked_engines:
+                continue
+
+            remote_dp_size = int(meta.remote_dp_size)
+            port = int(meta.remote_handshake_port)
+            tp_size = int(meta.tp_size)
+
+            # Submit handshakes for every not-yet-known dp rank UNDER the lock;
+            # do NOT hold the lock across the join or the TP collective (a
+            # stalled recv must not block another thread's lock acquisition).
+            futures: list[tuple[str, Future[set[str]]]] = []
+            with self._handshake_lock:
+                for cur_dp_rank in range(remote_dp_size):
+                    dp_engine_id = self.get_engine_name_with_dp(
+                        remote_engine_id, cur_dp_rank
+                    )
+                    if dp_engine_id in self._remote_agents:
+                        continue
+                    host = self._pick_host_for_dp_rank(meta, cur_dp_rank)
+                    fut = self._handshake_initiation_executor.submit(
+                        self._moriio_handshake,
+                        host,
+                        port,
+                        tp_size,
+                        dp_engine_id,
+                        cur_dp_rank,
+                    )
+                    futures.append((dp_engine_id, fut))
+
+            # Join WITHOUT the lock. Each handshake is bounded by RCVTIMEO, so a
+            # dead prefill rank surfaces as a HandshakeError in seconds. Catch
+            # all errors here — never raise before the all-reduce.
+            all_ok = True
+            results: dict[str, set[str]] = {}
+            for dp_engine_id, fut in futures:
+                try:
+                    results[dp_engine_id] = fut.result()
+                except Exception:
+                    logger.exception(
+                        "Eager MoRIIO handshake failed for %s", dp_engine_id
+                    )
+                    all_ok = False
+
+            with self._handshake_lock:
+                for dp_engine_id, agents in results.items():
+                    self._remote_agents[dp_engine_id] = agents
+
+            # TP-uniform success vote AND lockstep barrier in one CPU
+            # all-reduce(MIN): blocks until all TP workers arrive, then every
+            # worker sees the same verdict. CPU group (gloo) — never enqueues on
+            # the model compute stream, so it cannot reorder against the forward
+            # NCCL collectives. All TP workers MUST reach this; guaranteed
+            # because `engines` comes from identical scheduler metadata. Logged
+            # per rank for cross-rank verification.
+            logger.info(
+                "Eager MoRIIO handshake: engine=%s dp_size=%d new_ranks=%d "
+                "ok=%s tp_rank=%d",
+                remote_engine_id,
+                remote_dp_size,
+                len(futures),
+                all_ok,
+                self.tp_rank,
+            )
+            vote = torch.tensor(
+                [1 if all_ok else 0], device="cpu", dtype=torch.int32
+            )
+            dist.all_reduce(
+                vote, group=self.tp_group.cpu_group, op=dist.ReduceOp.MIN
+            )
+            if int(vote.item()) == 0:
+                raise HandshakeError(
+                    f"Eager MoRIIO handshake failed for {remote_engine_id} on "
+                    f"at least one TP rank; failing this step fast to avoid a "
+                    f"TP collective hang"
+                )
+
+            self._eager_handshaked_engines.add(remote_engine_id)
+
     def start_load_kv(self, metadata: MoRIIOConnectorMetadata):
         """
         Start loading by triggering non-blocking moriio_xfer.
         We check for these trnxs to complete in each step().
         """
-        self.transfer_id_to_request_id = metadata.transfer_id_to_request_id
+        # Merge (rather than overwrite) so the worker-side mapping survives
+        # after the scheduler-side request_finished() unmaps a transfer_id.
+        # The producer needs this entry to translate the consumer's
+        # transfer_id notification (see get_finished) back to its own internal
+        # request_id, and that notification can arrive several steps after
+        # request_finished. get_finished() pops entries after a successful
+        # translation, so the dict stays bounded.
+        for transfer_id in metadata.freed_transfer_ids:
+            request_id = self.transfer_id_to_request_id.get(transfer_id)
+            self._forget_transfer_mapping(transfer_id, request_id)
+            self._drop_pending_unmapped_done_tid(transfer_id, request_id)
+        self._unmatched_write_completions.difference_update(metadata.freed_transfer_ids)
+        for transfer_id, req_id in metadata.transfer_id_to_request_id.items():
+            self._remember_transfer_mapping(transfer_id, req_id)
         if self.is_producer:
             self.moriio_wrapper.async_wait_reqid()
             return
         if self.mode == MoRIIOMode.WRITE:
             return
+
+        # Eager all-rank handshake (TP-lockstep safe) before any read. Fires
+        # once per remote engine; no-op on warm steps. Replaces the per-request
+        # build-on-demand handshake that desynced the TP forward collective.
+        self._eager_handshake_all_dp_ranks(metadata)
 
         wait_handshake_readd_req = False
         remote_engine_id = None
@@ -1569,11 +2274,13 @@ class MoRIIOConnectorWorker:
                 str(meta.remote_host) + ":" + str(meta.remote_handshake_port)
             )
             meta.remote_engine_id = remote_engine_id
-            dp0_remote_engine_id = self.get_engine_name_with_dp(remote_engine_id, 0)
-            if dp0_remote_engine_id not in self._remote_agents:
+            target_remote_engine_id = self.get_engine_name_with_dp(
+                remote_engine_id, int(meta.remote_dp_rank)
+            )
+            if target_remote_engine_id not in self._remote_agents:
                 # Initiate handshake with remote engine to exchange metadata.
                 with self._handshake_lock:
-                    if remote_engine_id not in self._remote_agents:
+                    if target_remote_engine_id not in self._remote_agents:
                         self._background_moriio_handshake(
                             req_id, remote_engine_id, meta
                         )
@@ -1607,26 +2314,67 @@ class MoRIIOConnectorWorker:
                 not self._ready_requests.empty()
                 and remote_engine_id in self.load_ready_flag
             ):
-                self._read_blocks_for_req(*self._ready_requests.get_nowait())
+                while not self._ready_requests.empty():
+                    self._read_blocks_for_req(*self._ready_requests.get_nowait())
                 break
             else:
                 break
 
         self._reqs_to_send.update(metadata.reqs_to_send)
 
+    def _ensure_remote_dp_handshaked(self, meta: ReqMeta) -> None:
+        """Build-on-demand handshake for the prefill DP rank THIS request reads
+        from.
+
+        With heterogeneous parallelism (e.g. DP-prefill <-> TP-decode) a request
+        can target any remote DP rank, but the first-contact all-to-all
+        handshake only fires once and has no retry: a rank whose prefill
+        handshake listener wasn't up yet (or that was simply never contacted) is
+        left with no entry in layer_name_to_remote_kv_cache_metadata. Reading
+        from it then KeyErrors in _get_built_session and kills the EngineCore.
+
+        Handshake the needed rank synchronously on first use here. Cost is one
+        MoRIIO metadata exchange (~1-4ms measured), one-time per rank — the
+        result is cached in layer_name_to_remote_kv_cache_metadata /
+        built_write_session and reused thereafter. No-op once handshaked, so
+        the symmetric / already-warmed path is unaffected.
+        """
+        base_engine_id = str(meta.remote_host) + ":" + str(meta.remote_handshake_port)
+        dp_rank = int(meta.remote_dp_rank)
+        dp_engine_id = self.get_engine_name_with_dp(base_engine_id, dp_rank)
+        if dp_engine_id in self.layer_name_to_remote_kv_cache_metadata:
+            return
+        with self._handshake_lock:
+            # Re-check under the lock — another worker step may have just
+            # handshaked this rank.
+            if dp_engine_id in self.layer_name_to_remote_kv_cache_metadata:
+                return
+            host = self._pick_host_for_dp_rank(meta, dp_rank)
+            # Fallback only: the eager all-rank handshake in start_load_kv should
+            # have covered every rank already. Hitting this on the read path
+            # means a rank was missed — log loudly; it should NOT appear in a
+            # healthy run (it reintroduces the TP-desync risk for this one rank).
+            logger.warning(
+                "MoRIIO FALLBACK synchronous handshake for remote dp rank %d "
+                "(%s) on the read path — eager handshake should have covered "
+                "this; investigate if seen in a healthy run",
+                dp_rank,
+                dp_engine_id,
+            )
+            self._remote_agents[dp_engine_id] = self._moriio_handshake(
+                host,
+                int(meta.remote_handshake_port),
+                int(meta.tp_size),
+                dp_engine_id,
+                dp_rank,
+            )
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         logger.debug(
             "Remote agent %s available, calling _read_blocks for req %s",
             meta.remote_engine_id,
             req_id,
         )
-        # Multi-node TP: remote_host here is used by _read_blocks to record the
-        # post-transfer notify callback address (so prefill can free its KV
-        # blocks). For multi-node prefill the notify must go to the prefill
-        # node that actually owns this worker's KV slice, not the prefill
-        # head. _pick_remote_host returns meta.remote_host unchanged for
-        # single-host setups, preserving TP=8 / monolithic behaviour.
-        actual_remote_host = self._pick_remote_host(meta)
+        actual_remote_host = self._pick_host_for_dp_rank(meta, int(meta.remote_dp_rank))
         self._read_blocks(
             request_id=req_id,
             transfer_id=meta.transfer_id,
@@ -1635,6 +2383,8 @@ class MoRIIOConnectorWorker:
             remote_block_ids=meta.remote_block_ids,
             remote_host=actual_remote_host,
             remote_notify_port=meta.remote_notify_port,
+            remote_dp_rank=meta.remote_dp_rank,
+            remote_tp_size=int(meta.tp_size),
         )
 
     def _write_blocks_for_req(self, req_id: ReqId, meta: ReqMeta, layer_name, kv_layer):
@@ -1790,30 +2540,59 @@ class MoRIIOConnectorWorker:
         transfer_id: str,
         remote_host: str,
         remote_notify_port: int,
+        remote_dp_rank: int = 0,
+        remote_tp_size: int = 1,
     ) -> None:
         if self.mode == MoRIIOMode.WRITE:
             return
 
-        dp0_engine_id = self.get_engine_name_with_dp(dst_engine_id, 0)
-        sessions, remote_moriio_meta = self._get_built_session(dp0_engine_id)
+        # Use the prefill DP rank that actually computed the KV (forwarded by
+        # the proxy via kv_transfer_params["remote_dp_rank"]). Hardcoding DP0
+        # can read from a different rank's memory registration; per-DP ranks
+        # may expose different num_blocks, so high block ids can exceed the
+        # wrong rank's memory region.
+        remote_dp_engine_id = self.get_engine_name_with_dp(
+            dst_engine_id, int(remote_dp_rank)
+        )
+        sessions, remote_moriio_meta = self._get_built_session(remote_dp_engine_id)
 
         first_layer = list(self.layer_name_to_local_kv_cache_metadata.keys())[0]
         offs = self._compute_block_transfer_offsets(
             first_layer, local_block_ids, remote_block_ids, remote_moriio_meta
         )
 
-        for layer_name in self.layer_name_to_local_kv_cache_metadata:
-            sess_idx = list(self.layer_name_to_local_kv_cache_metadata.keys()).index(
-                layer_name
+        # Heterogeneous-TP: target the remote's TP index (tp0 for a TP1 prefill),
+        # else the read-completion notify lands on a phantom port and the
+        # producer never sees finished_sending -> KV leak. See _remote_tp_rank.
+        notify_port = str(
+            remote_notify_port
+            + get_port_offset(
+                int(remote_dp_rank),
+                self._remote_tp_rank(int(remote_tp_size)),
+                int(remote_tp_size),
             )
-            # TODO : apply multi-session batch-read when moriio support it
-            transfer_status = self.moriio_wrapper.read_remote_data(
-                offs[2], offs[0], offs[1], sessions[sess_idx]
+        )
+        with self.moriio_wrapper.lock:
+            self._recving_transfer_local_block_ids[request_id] = set(local_block_ids)
+            self._recving_transfers_callback_addr[request_id] = (
+                remote_host,
+                notify_port,
+                transfer_id,
             )
-            with self.moriio_wrapper.lock:
-                self._recving_transfers[request_id].append(transfer_status)
-                self._recving_transfers_callback_addr[request_id] = (
-                    remote_host,
-                    str(remote_notify_port + self.tp_rank),
-                    transfer_id,
+
+        with self.moriio_wrapper.lock:
+            for sess_idx, layer_name in enumerate(
+                self.layer_name_to_local_kv_cache_metadata
+            ):
+                self._pending_read_plans[request_id][layer_name] = LayerTransferPlan(
+                    request_id=request_id,
+                    transfer_id=transfer_id,
+                    layer_name=layer_name,
+                    sess_idx=sess_idx,
+                    transfer_local_offsets=offs[0],
+                    transfer_remote_offsets=offs[1],
+                    transfer_sizes=offs[2],
+                    session=sessions[sess_idx],
                 )
+
+        self._dispatch_pending_reads()

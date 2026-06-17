@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import msgspec
+import psutil
 import regex as re
 import torch
 import zmq
@@ -25,7 +26,8 @@ from vllm.logger import init_logger
 from vllm.utils.network_utils import (
     get_ip,
     get_open_port,
-    make_zmq_socket,
+    is_valid_ipv6_address,
+    split_zmq_path,
 )
 
 if TYPE_CHECKING:
@@ -69,6 +71,7 @@ class LayerTransferPlan:
     transfer_local_offsets: list[int]
     transfer_remote_offsets: list[int]
     transfer_sizes: list[int]
+    session: Any
     use_batch: bool = True
 
 
@@ -162,10 +165,18 @@ class TransferError(MoRIIOError):
     pass
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 def get_moriio_mode(kv_transfer_config: KVTransferConfig) -> MoRIIOMode:
-    read_mode = str(
-        kv_transfer_config.kv_connector_extra_config.get("read_mode", "false")
-    ).lower().strip() in ("true", "1")
+    read_mode = _as_bool(
+        kv_transfer_config.kv_connector_extra_config.get("read_mode", False)
+    )
     logger.debug("MoRIIO Connector read_mode: %s", read_mode)
     if read_mode:
         return MoRIIOMode.READ
@@ -187,7 +198,6 @@ def resolve_host_ip(extra_config: dict) -> str:
     cannot be propagated to the worker processes that bind the transfer engine.
     """
     return extra_config.get("host_ip") or get_ip()
-
 
 def _normalize_node_hosts(value: Any, config_key: str) -> list[str]:
     if value is None:
@@ -248,6 +258,19 @@ def _warn_deprecated_env_vars() -> None:
             )
 
 
+def _get_non_negative_int_extra_config(
+    extra_config: dict[str, Any],
+    key: str,
+    default: int,
+) -> int:
+    value = int(extra_config.get(key, default))
+    if value < 0:
+        raise ValueError(
+            f"Invalid MoRIIO {key}={value}; expected a non-negative integer."
+        )
+    return value
+
+
 @dataclass
 class MoRIIOConfig:
     local_ip: str
@@ -270,6 +293,10 @@ class MoRIIOConfig:
     num_workers: int = 1
     backend: str = "rdma"
     node_hosts: list[str] = field(default_factory=list)
+    handshake_timeout: float = 10.0
+    max_inflight_global: int = 0
+    max_inflight_per_transfer: int = 0
+    max_dispatch_layers: int = 0
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> "MoRIIOConfig":
@@ -296,7 +323,6 @@ class MoRIIOConfig:
         #                     (-1 lets the MoRI backend choose).
         # num_workers      -> Number of background worker threads the MoRI
         #                     engine uses for transfer processing.
-
         # TODO : merge notify_port and handshake_port to simplify port management
         #        supports non-contiguous ports
         assert vllm_config.kv_transfer_config is not None, (
@@ -310,7 +336,7 @@ class MoRIIOConfig:
         base_notify_port = int(extra_config["notify_port"])
         dp_size = vllm_config.parallel_config.data_parallel_size
         tp_size = get_tensor_model_parallel_world_size()
-        port_offset = get_port_offset(dp_rank, tp_rank)
+        port_offset = get_port_offset(dp_rank, tp_rank, tp_size)
         backend = str(extra_config.get("backend", "rdma")).lower()
         if backend not in ("rdma", "xgmi"):
             raise ValueError(
@@ -350,6 +376,26 @@ class MoRIIOConfig:
             node_hosts=get_moriio_node_hosts(kv_transfer_config, local_ip),
             transfer_timeout=transfer_timeout,
             defer_timeout=defer_timeout,
+            handshake_timeout=float(
+                extra_config.get(
+                    "handshake_timeout", MoRIIOConstants.DEFAULT_HANDSHAKE_TIMEOUT
+                )
+            ),
+            max_inflight_global=_get_non_negative_int_extra_config(
+                extra_config,
+                "max_inflight_global",
+                0,
+            ),
+            max_inflight_per_transfer=_get_non_negative_int_extra_config(
+                extra_config,
+                "max_inflight_per_transfer",
+                0,
+            ),
+            max_dispatch_layers=_get_non_negative_int_extra_config(
+                extra_config,
+                "max_dispatch_layers",
+                0,
+            ),
         )
 
 
@@ -377,6 +423,18 @@ class MoRIIOConstants:
     # notification is reaped and its blocks force-freed.
     # Overridable via kv_connector_extra_config["defer_timeout"].
     DEFAULT_DEFER_TIMEOUT = 60.0
+    # Grace period (seconds) during which has_pending_deferred_sends keeps
+    # scheduler probes active after a deferred send is created.
+    # Overridable via kv_connector_extra_config["defer_drain_grace"].
+    DEFAULT_DEFER_DRAIN_GRACE = 2.0
+    # Timeout (seconds) for a single MoRIIO handshake metadata exchange. Bounds
+    # a dead/slow remote handshake listener so a missing prefill rank fails fast
+    # (HandshakeError) instead of blocking a TP worker forever on recv() and
+    # desyncing the TP collective. The eager all-rank handshake runs at first
+    # request (post health-gate), so the remote listener is already up and
+    # answers in ~ms; this is a safety net for genuine mid-run faults.
+    # Overridable via kv_connector_extra_config["handshake_timeout"].
+    DEFAULT_HANDSHAKE_TIMEOUT = 10.0
 
 
 # The router embeds both zmq_addresses in the request_id:
@@ -451,6 +509,12 @@ class ReqMeta:
     remote_engine_id: str
     tp_size: int
     remote_dp_size: int
+    # DP rank that handled the prefill on the remote side. Proxy sets this
+    # from `selected_prefill_dp_rank` in kv_transfer_params. Used by
+    # `_read_blocks` to pick the correct per-rank session/MR instead of
+    # always reading from remote DP0 (which mismatches num_blocks across
+    # ranks and overflows remote DP0's MR at high concurrency).
+    remote_dp_rank: int = 0
     # Ordered list of all prefill-instance host IPs for multi-node TP.
     # Each decode worker picks remote_hosts[tp_rank // ranks_per_node] as its
     # actual peer host for handshake + post-transfer notify. None or len<=1
@@ -464,13 +528,15 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
         self.reqs_to_send: dict[ReqId, float] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
+        self.freed_transfer_ids: set[TransferId] = set()
 
     def __repr__(self):
         return (
             f"MoRIIOConnectorMetadata: reqs_to_recv={self.reqs_to_recv}, "
             f"reqs_to_save={self.reqs_to_save}, "
             f"reqs_to_send={self.reqs_to_send}, "
-            f"transfer_id_to_request_id={self.transfer_id_to_request_id}"
+            f"transfer_id_to_request_id={self.transfer_id_to_request_id}, "
+            f"freed_transfer_ids={self.freed_transfer_ids}"
         )
 
     def add_new_req(
@@ -538,6 +604,7 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
                 kv_transfer_params.get("remote_tp_size", 1),
             ),
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
+            remote_dp_rank=int(kv_transfer_params.get("remote_dp_rank", 0) or 0),
             remote_hosts=remote_hosts or None,
         )
         if write_mode:
@@ -546,8 +613,74 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
             self.reqs_to_recv[request_id] = _req
 
 
+_MORIIO_ZMQ_KEEPALIVE_OPTS = (
+    (zmq.TCP_KEEPALIVE, 1),
+    (zmq.TCP_KEEPALIVE_IDLE, 30),
+    (zmq.TCP_KEEPALIVE_INTVL, 10),
+    (zmq.TCP_KEEPALIVE_CNT, 3),
+)
+
+
+def _make_moriio_zmq_socket(
+    ctx: zmq.Context,
+    path: str,
+    socket_type: Any,
+    *,
+    identity: bytes | None = None,
+    linger: int | None = None,
+    router_handover: bool = False,
+) -> zmq.Socket:
+    mem = psutil.virtual_memory()
+    total_mem = mem.total / 1024**3
+    available_mem = mem.available / 1024**3
+    buf_size = int(0.5 * 1024**3) if total_mem > 32 and available_mem > 16 else -1
+
+    sock = ctx.socket(socket_type)
+
+    if socket_type in (zmq.PULL, zmq.DEALER, zmq.ROUTER):
+        sock.setsockopt(zmq.RCVHWM, 0)
+        sock.setsockopt(zmq.RCVBUF, buf_size)
+
+    if socket_type in (zmq.PUSH, zmq.DEALER, zmq.ROUTER):
+        sock.setsockopt(zmq.SNDHWM, 0)
+        sock.setsockopt(zmq.SNDBUF, buf_size)
+
+    if socket_type == zmq.ROUTER and router_handover:
+        sock.setsockopt(zmq.ROUTER_HANDOVER, 1)
+
+    if identity is not None:
+        sock.setsockopt(zmq.IDENTITY, identity)
+
+    if linger is not None:
+        sock.setsockopt(zmq.LINGER, linger)
+
+    # Mgmt-rail notify/handshake streams are sparse; a silently dead TCP peer
+    # can park reads until the retransmit ladder expires. Keepalive applies to
+    # accepted connections too and must be set before bind/connect.
+    for option, value in _MORIIO_ZMQ_KEEPALIVE_OPTS:
+        sock.setsockopt(option, value)
+
+    scheme, host, _ = split_zmq_path(path)
+    if scheme == "tcp" and is_valid_ipv6_address(host):
+        sock.setsockopt(zmq.IPV6, 1)
+
+    if socket_type == zmq.ROUTER:
+        sock.bind(path)
+    else:
+        sock.connect(path)
+
+    return sock
+
+
 @contextlib.contextmanager
-def zmq_ctx(socket_type: Any, addr: str) -> Iterator[zmq.Socket]:
+def zmq_ctx(
+    socket_type: Any,
+    addr: str,
+    *,
+    identity: bytes | None = None,
+    linger: int | None = None,
+    router_handover: bool = False,
+) -> Iterator[zmq.Socket]:
     """Context manager for a ZMQ socket"""
 
     if socket_type not in (zmq.ROUTER, zmq.REQ, zmq.DEALER):
@@ -556,9 +689,15 @@ def zmq_ctx(socket_type: Any, addr: str) -> Iterator[zmq.Socket]:
     ctx: zmq.Context | None = None
     try:
         ctx = zmq.Context()  # type: ignore[attr-defined]
-        yield make_zmq_socket(
-            ctx=ctx, path=addr, socket_type=socket_type, bind=socket_type == zmq.ROUTER
+        sock = _make_moriio_zmq_socket(
+            ctx,
+            addr,
+            socket_type,
+            identity=identity,
+            linger=linger,
+            router_handover=router_handover,
         )
+        yield sock
     finally:
         if ctx is not None:
             ctx.destroy(linger=0)
