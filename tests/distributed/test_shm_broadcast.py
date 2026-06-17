@@ -348,6 +348,55 @@ def test_message_queue_busy_to_idle():
     distributed_run(worker_fn_test_busy_to_idle, 4)
 
 
+
+def test_reader_timeout_rechecks_independent_of_warning_interval():
+    """Warning cadence must not control the SHM reader poll interval."""
+    with (
+        mock.patch(
+            "vllm.distributed.device_communicators.shm_broadcast."
+            "SHM_READER_RECHECK_INTERVAL_MS",
+            new=7,
+        ),
+        mock.patch(
+            "vllm.distributed.device_communicators.shm_broadcast."
+            "VLLM_RINGBUFFER_WARNING_INTERVAL",
+            new=60,
+        ),
+    ):
+        timeout = MessageQueue.ReadTimeoutWithWarnings(
+            timeout=None, should_warn=True
+        )
+        assert timeout.timeout_ms() == 7
+
+
+def test_acquire_read_releases_slot_when_reader_raises():
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024 * 1024,
+        max_chunks=1,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    writer.wait_until_ready()
+    reader.wait_until_ready()
+
+    writer.enqueue({"payload": "first"})
+
+    with pytest.raises(RuntimeError, match="reader failed"):
+        with reader.acquire_read(timeout=0.1):
+            raise RuntimeError("reader failed")
+
+    with writer.buffer.get_metadata(0) as metadata_buffer:
+        assert metadata_buffer[0] == 1
+        assert metadata_buffer[1] == 1
+
+    with writer.acquire_write(timeout=0.1) as buf:
+        buf[0] = 0
+
+    writer.shutdown()
+    reader.shutdown()
+
+
 def test_warning_logs(caplog_vllm):
     """
     Test that warning logs are emitted at VLLM_RINGBUFFER_WARNING_INTERVAL intervals
