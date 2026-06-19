@@ -277,14 +277,16 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
-        return self.model.compute_logits(hidden_states, spec_step_idx)
+        return self.model.compute_logits(
+            hidden_states, spec_step_idx=spec_step_idx
+        )
 
     def get_top_tokens(
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        return self.model.get_top_tokens(hidden_states, spec_step_idx)
+        return self.model.get_top_tokens(hidden_states, spec_step_idx=spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         rocm_aiter_moe_shared_expert_enabled = (

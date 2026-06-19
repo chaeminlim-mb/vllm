@@ -5,6 +5,7 @@ from unittest import mock
 
 import pytest
 import torch
+import torch.nn as nn
 
 from tests.v1.attention.utils import (
     BatchSpec,
@@ -22,6 +23,7 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.load import LoadConfig
+from vllm.model_executor.models.deepseek_mtp import DeepSeekMultiTokenPredictor
 from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -29,6 +31,78 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 
 mimo_7b_dir = "XiaomiMiMo/MiMo-7B-Base"
 DEVICE_TYPE = current_platform.device_type
+
+
+class _DeterministicMTPHead:
+    def __init__(self, token_id: int, vocab_size: int) -> None:
+        self.token_id = token_id
+        self.vocab_size = vocab_size
+
+
+class _DeterministicSharedHead(nn.Module):
+    def __init__(self, token_id: int, vocab_size: int) -> None:
+        super().__init__()
+        self.head = _DeterministicMTPHead(token_id, vocab_size)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+
+class _DeterministicMTPLayer(nn.Module):
+    def __init__(self, token_id: int, vocab_size: int) -> None:
+        super().__init__()
+        self.shared_head = _DeterministicSharedHead(token_id, vocab_size)
+
+
+class _DeterministicLogitsProcessor:
+    def __call__(
+        self,
+        head: _DeterministicMTPHead,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = hidden_states.new_full(
+            (hidden_states.shape[0], head.vocab_size), -100.0
+        )
+        logits[:, head.token_id] = 100.0
+        return logits
+
+    def get_top_tokens(
+        self,
+        head: _DeterministicMTPHead,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return self(head, hidden_states).argmax(dim=-1)
+
+
+def _make_deterministic_deepseek_mtp_predictor() -> DeepSeekMultiTokenPredictor:
+    predictor = DeepSeekMultiTokenPredictor.__new__(DeepSeekMultiTokenPredictor)
+    nn.Module.__init__(predictor)
+    predictor.mtp_start_layer_idx = 4
+    predictor.num_mtp_layers = 2
+    predictor.layers = nn.ModuleDict(
+        {
+            "4": _DeterministicMTPLayer(token_id=1, vocab_size=8),
+            "5": _DeterministicMTPLayer(token_id=6, vocab_size=8),
+        }
+    )
+    predictor.logits_processor = _DeterministicLogitsProcessor()
+    return predictor
+
+
+def test_deepseek_mtp_local_argmax_honors_spec_step_idx():
+    predictor = _make_deterministic_deepseek_mtp_predictor()
+    hidden_states = torch.zeros(3, 4)
+
+    for spec_step_idx, expected_token_id in ((0, 1), (1, 6), (2, 1)):
+        expected = predictor.compute_logits(
+            hidden_states, spec_step_idx=spec_step_idx
+        ).argmax(dim=-1)
+        actual = predictor.get_top_tokens(
+            hidden_states, spec_step_idx=spec_step_idx
+        )
+
+        assert torch.equal(actual, expected)
+        assert torch.equal(actual, torch.full_like(actual, expected_token_id))
 
 
 def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
