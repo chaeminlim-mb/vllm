@@ -431,6 +431,9 @@ class MoRIIOConnectorScheduler:
 
         return len(token_ids) - 1 - num_computed_tokens, False
 
+    def _num_blocks_for_token_span(self, num_tokens: int) -> int:
+        return (max(num_tokens, 0) + self.block_size - 1) // self.block_size
+
     def send_notify_block(
         self,
         req_id: ReqId,
@@ -446,6 +449,9 @@ class MoRIIOConnectorScheduler:
                 ctx=ctx, path=path, socket_type=zmq.DEALER, bind=False
             )
             self.paths[path] = sock
+        if not block_notify_list:
+            self.paths[path].send(transfer_id.encode("UTF-8"))
+            return
 
         data = {
             "req_id": req_id,
@@ -472,7 +478,13 @@ class MoRIIOConnectorScheduler:
         self.map_request_id(request_id, transfer_id)
         if params.get("do_remote_decode"):
             local_block_ids = blocks.get_block_ids()[0]
-            self._reqs_need_save[request.request_id] = (request, local_block_ids)
+            prompt_block_count = self._num_blocks_for_token_span(
+                request.num_prompt_tokens
+            )
+            self._reqs_need_save[request.request_id] = (
+                request,
+                local_block_ids[:prompt_block_count],
+            )
 
         if params is not None and params.get("do_remote_prefill"):
             if self.mode == MoRIIOMode.READ:
@@ -484,15 +496,29 @@ class MoRIIOConnectorScheduler:
                         # a full prefix cache hit on the D worker. We need to call
                         # send_notify in _read_blocks to free the memory on the P.
 
-                        # Get local blocks to pull remote KV into. If the
-                        # producer returned a longer remote list, trim the
-                        # remote suffix to match the local allocation. Do not
-                        # replace local ids: they index the decode KV cache.
+                        # Get local blocks to pull remote KV into. MTP/draft
+                        # lookahead can allocate extra tail blocks, so transfer
+                        # only the external-token prefix and keep local/remote
+                        # block indices aligned.
+                        external_block_count = self._num_blocks_for_token_span(
+                            num_external_tokens
+                        )
                         local_block_ids = blocks.get_block_ids()[0]
-                        assert len(local_block_ids) <= len(remote_block_ids)
-                        if len(local_block_ids) != len(remote_block_ids):
-                            remote_block_ids = remote_block_ids[-len(local_block_ids) :]
-                            params["remote_block_ids"] = remote_block_ids
+                        if (
+                            len(local_block_ids) < external_block_count
+                            or len(remote_block_ids) < external_block_count
+                        ):
+                            raise ValueError(
+                                "MoRIIO remote prefill block span mismatch: "
+                                f"request_id={request.request_id!r}, "
+                                f"num_external_tokens={num_external_tokens}, "
+                                f"required_blocks={external_block_count}, "
+                                f"local_blocks={len(local_block_ids)}, "
+                                f"remote_blocks={len(remote_block_ids)}"
+                            )
+                        local_block_ids = local_block_ids[:external_block_count]
+                        remote_block_ids = remote_block_ids[:external_block_count]
+                        params["remote_block_ids"] = remote_block_ids
 
                         self._reqs_need_recv[request.request_id] = (
                             request,
@@ -518,6 +544,20 @@ class MoRIIOConnectorScheduler:
                 )
                 remote_host, _, remote_notify_port = parse_moriio_zmq_address(peer_zmq)
 
+                notify_block_count = self._num_blocks_for_token_span(
+                    num_external_tokens
+                )
+                block_notify_list = blocks.get_block_ids()[0]
+                if len(block_notify_list) < notify_block_count:
+                    raise ValueError(
+                        "MoRIIO WRITE notify block span mismatch: "
+                        f"request_id={request.request_id!r}, "
+                        f"num_external_tokens={num_external_tokens}, "
+                        f"required_blocks={notify_block_count}, "
+                        f"local_blocks={len(block_notify_list)}"
+                    )
+                block_notify_list = block_notify_list[:notify_block_count]
+
                 for tp_index in range(self.tp_size):
                     target_port = remote_notify_port + get_port_offset(
                         remote_dp_rank, tp_index, self.tp_size
@@ -526,7 +566,7 @@ class MoRIIOConnectorScheduler:
                     self.send_notify_block(
                         req_id=request.request_id,
                         transfer_id=request.kv_transfer_params["transfer_id"],
-                        block_notify_list=blocks.get_block_ids()[0],
+                        block_notify_list=block_notify_list,
                         host=remote_host,
                         port=target_port,
                     )
@@ -582,7 +622,12 @@ class MoRIIOConnectorScheduler:
                         block_ids = new_block_ids[0]
                         # TODO : hybrid attn, etc
                         req, existing_blocks = self._reqs_need_pending_save[req_id]
-                        updated_blocks = list(existing_blocks) + (block_ids)
+                        prompt_block_count = self._num_blocks_for_token_span(
+                            req.num_prompt_tokens
+                        )
+                        updated_blocks = (
+                            list(existing_blocks) + block_ids
+                        )[:prompt_block_count]
                         self._reqs_need_pending_save[req_id] = (req, updated_blocks)
                         if (
                             len(self._reqs_need_pending_save[req_id][1])
@@ -682,9 +727,11 @@ class MoRIIOConnectorScheduler:
         ):
             return False, None
 
-        # computed_block_ids = block_ids if all_full else block_ids[:-1]
-        computed_block_ids = block_ids
-        # If prompt < block_size, no xfer so free blocks immediately.
+        transfer_tokens = request.num_prompt_tokens
+        if self.mode == MoRIIOMode.READ:
+            transfer_tokens -= 1
+        prompt_block_count = self._num_blocks_for_token_span(transfer_tokens)
+        computed_block_ids = block_ids[:prompt_block_count]
         delay_free_blocks = len(computed_block_ids) > 0
 
         if delay_free_blocks:
@@ -1575,10 +1622,9 @@ class MoRIIOConnectorWorker:
 
         self.dst_num_blocks[self.engine_id] = self.num_blocks
         self.kv_caches = kv_caches  # layer name to kv cache
-        # DIAG: dump per-layer shape/stride/MR-len so we can compare against
-        # the first-layer values that _compute_block_transfer_offsets assumes
-        # uniform. If any non-first layer differs, _read_blocks will compute
-        # offsets that overflow the smaller MR → C++ "length out of range".
+        # DIAG: dump per-layer shape/stride/MR-len. _read_blocks computes
+        # offsets per layer, so differing non-first-layer strides are expected
+        # to be visible here rather than hidden behind first-layer assumptions.
         for _ln, _kvc in kv_caches.items():
             _mr_len = _kvc.numel() * _kvc.element_size()
             logger.debug(
@@ -2676,50 +2722,6 @@ class MoRIIOConnectorWorker:
             )
         sessions, remote_moriio_meta = self._get_built_session(remote_dp_engine_id)
 
-        first_layer = list(self.layer_name_to_local_kv_cache_metadata.keys())[0]
-        offs = self._compute_block_transfer_offsets(
-            first_layer, local_block_ids, remote_block_ids, remote_moriio_meta
-        )
-
-        # DIAG: log per-call so we can pinpoint which (decode_rank,
-        # remote_rank) pair overflows. Fires on FIRST few calls AND on every
-        # overflow. local_mr_len = decode's own kv_cache size; remote_mr_len
-        # = remote rank's num_blocks * block_len (from handshake metadata).
-        _max_local = max(o + s for o, s in zip(offs[0], offs[2])) if offs[2] else 0
-        _max_remote = max(o + s for o, s in zip(offs[1], offs[2])) if offs[2] else 0
-        _first_kvc = self.kv_caches[first_layer]
-        _local_mr_len = _first_kvc.numel() * _first_kvc.element_size()
-        try:
-            _remote_mr_len = int(remote_moriio_meta.num_blocks) * int(
-                remote_moriio_meta.block_len
-            )
-        except Exception:
-            _remote_mr_len = -1
-        _diag_n = getattr(self, "_diag_read_blocks_n", 0) + 1
-        self._diag_read_blocks_n = _diag_n
-        _overflow = _max_local > _local_mr_len or (
-            _remote_mr_len > 0 and _max_remote > _remote_mr_len
-        )
-        if _diag_n <= 3 or _overflow:
-            logger.debug(
-                "MoRIIO READ diag #%d: dp_rank=%s remote_dp_rank=%s "
-                "engine_id=%s max_local=%d local_mr_len=%d "
-                "max_remote=%d remote_mr_len=%d "
-                "max_local_bid=%s max_remote_bid=%s n_blocks=%d overflow=%s",
-                _diag_n,
-                getattr(self, "dp_rank", "?"),
-                int(remote_dp_rank),
-                remote_dp_engine_id,
-                _max_local,
-                _local_mr_len,
-                _max_remote,
-                _remote_mr_len,
-                max(local_block_ids) if local_block_ids else -1,
-                max(remote_block_ids) if remote_block_ids else -1,
-                len(local_block_ids),
-                _overflow,
-            )
-
         # Send the read-completion notify to the SAME rank we read from (eff_tp),
         # else the producer never sees finished_sending -> KV leak. For legacy
         # configs eff_tp == _remote_tp_rank (tp0 for a TP1 prefill; tp_rank for
@@ -2733,6 +2735,16 @@ class MoRIIOConnectorWorker:
                 int(remote_tp_size),
             )
         )
+        if not local_block_ids:
+            with self.moriio_wrapper.lock:
+                if os.getenv("VLLM_PD_STAGE_TELEMETRY", "0") == "1":
+                    if request_id not in self._kv_xfer_complete_ts_mono:
+                        self._kv_xfer_complete_ts_mono[request_id] = time.monotonic()
+                        self._kv_xfer_complete_ts_wallclock[request_id] = time.time()
+                self.moriio_wrapper.send_notify(transfer_id, remote_host, notify_port)
+                self._forget_transfer_mapping(transfer_id)
+            return
+
         with self.moriio_wrapper.lock:
             self._recving_transfer_local_block_ids[request_id] = set(
                 local_block_ids
@@ -2745,10 +2757,56 @@ class MoRIIOConnectorWorker:
 
         # SQ-full backpressure deadline (shared across this request's layers).
         _sq_deadline = time.monotonic() + self.moriio_config.transfer_timeout
-        for layer_name in self.layer_name_to_local_kv_cache_metadata:
-            sess_idx = list(self.layer_name_to_local_kv_cache_metadata.keys()).index(
-                layer_name
+        for sess_idx, layer_name in enumerate(
+            self.layer_name_to_local_kv_cache_metadata
+        ):
+            offs = self._compute_block_transfer_offsets(
+                layer_name, local_block_ids, remote_block_ids, remote_moriio_meta
             )
+
+            # DIAG: log per-call/layer so we can pinpoint which (decode_rank,
+            # remote_rank, layer) pair overflows. local_mr_len = decode's own
+            # layer kv_cache size; remote_mr_len = remote rank's num_blocks *
+            # block_len from handshake metadata.
+            _max_local = (
+                max(o + s for o, s in zip(offs[0], offs[2])) if offs[2] else 0
+            )
+            _max_remote = (
+                max(o + s for o, s in zip(offs[1], offs[2])) if offs[2] else 0
+            )
+            _layer_kvc = self.kv_caches[layer_name]
+            _local_mr_len = _layer_kvc.numel() * _layer_kvc.element_size()
+            try:
+                _remote_mr_len = int(remote_moriio_meta.num_blocks) * int(
+                    remote_moriio_meta.block_len
+                )
+            except Exception:
+                _remote_mr_len = -1
+            _diag_n = getattr(self, "_diag_read_blocks_n", 0) + 1
+            self._diag_read_blocks_n = _diag_n
+            _overflow = _max_local > _local_mr_len or (
+                _remote_mr_len > 0 and _max_remote > _remote_mr_len
+            )
+            if _diag_n <= 3 or _overflow:
+                logger.debug(
+                    "MoRIIO READ diag #%d: dp_rank=%s remote_dp_rank=%s "
+                    "engine_id=%s layer=%s max_local=%d local_mr_len=%d "
+                    "max_remote=%d remote_mr_len=%d "
+                    "max_local_bid=%s max_remote_bid=%s n_blocks=%d overflow=%s",
+                    _diag_n,
+                    getattr(self, "dp_rank", "?"),
+                    int(remote_dp_rank),
+                    remote_dp_engine_id,
+                    layer_name,
+                    _max_local,
+                    _local_mr_len,
+                    _max_remote,
+                    _remote_mr_len,
+                    max(local_block_ids) if local_block_ids else -1,
+                    max(remote_block_ids) if remote_block_ids else -1,
+                    len(local_block_ids),
+                    _overflow,
+                )
             # TODO : apply multi-session batch-read when moriio support it
             # SQ-full backpressure. read_remote_data posts the RDMA READ
             # SYNCHRONOUSLY (the mori executor joins its worker before returning

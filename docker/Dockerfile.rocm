@@ -115,8 +115,12 @@ FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 # vLLM build stages
 FROM fetch_vllm AS build_vllm
 # Build vLLM (setup.py auto-detects sccache in PATH)
+# Debian's python3-jwt installs PyJWT without pip RECORD metadata; remove it
+# in this build stage only so other ROCm/RIXL base-stage caches stay reusable.
+RUN apt-get purge -y python3-jwt || true
 RUN cd vllm \
     && python3 -m pip install -r requirements/rocm.txt \
+    && export VLLM_VERSION_OVERRIDE=0.1.dev0+a9b8e64d2 \
     && python3 setup.py clean --all  \
     && python3 setup.py bdist_wheel --dist-dir=dist
 FROM scratch AS export_vllm
@@ -541,6 +545,10 @@ ARG AINIC_VERSION
 COPY --from=export_vllm /benchmarks ${COMMON_WORKDIR}/vllm/benchmarks
 COPY --from=export_vllm /examples ${COMMON_WORKDIR}/vllm/examples
 COPY --from=export_vllm /docker ${COMMON_WORKDIR}/vllm/docker
+
+# Keep legacy launcher paths working. The regression scripts invoke the MoRIIO
+# proxy from /app/vllm-src, while this image carries examples under /app/vllm.
+RUN ln -sfn ${COMMON_WORKDIR}/vllm ${COMMON_WORKDIR}/vllm-src
 
 # Use legacy IPC mode for HSA to avoid GPU memory pinning issues with UCX rocm_ipc
 # See: https://github.com/ROCm/rocm-libraries/issues/6266

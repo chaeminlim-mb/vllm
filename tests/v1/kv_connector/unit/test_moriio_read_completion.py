@@ -55,6 +55,7 @@ class FakeWrapper:
         self.notifies: list[tuple[str, str, str]] = []
         self.read_error: Exception | None = None
         self.read_results: list[FakeStatus | Exception] = []
+        self.read_calls: list[tuple[object, object, object, object]] = []
         self.notify_error: Exception | None = None
 
     def send_notify(self, transfer_id: str, host: str, port: str) -> None:
@@ -64,7 +65,8 @@ class FakeWrapper:
             raise error
         self.notifies.append((transfer_id, host, port))
 
-    def read_remote_data(self, *_args):
+    def read_remote_data(self, *args):
+        self.read_calls.append(args)
         if self.read_results:
             result = self.read_results.pop(0)
             if isinstance(result, Exception):
@@ -100,6 +102,7 @@ def make_worker() -> MoRIIOConnectorWorker:
     worker._pending_unmapped_done_tids = set()
     worker._unmatched_write_completions = set()
     worker.transfer_id_to_request_id = {}
+    worker.request_id_to_transfer_id = {}
     return worker
 
 
@@ -319,6 +322,49 @@ def test_failed_read_marks_local_blocks_invalid() -> None:
     assert "req0" not in worker._recving_transfers_callback_addr
     assert "req0" not in worker._recving_transfer_local_block_ids
     assert "transfer0" not in worker.transfer_id_to_request_id
+
+
+def test_read_blocks_computes_transfer_offsets_per_layer() -> None:
+    worker = make_worker()
+    worker.tp_rank = 2
+    worker.dp_rank = 0
+    worker.kv_caches = {"layer0": FakeTensor(), "layer1": FakeTensor()}
+    worker.layer_name_to_local_kv_cache_metadata = {"layer0": [], "layer1": []}
+    worker._get_built_session = lambda _engine_id: (
+        ["session0", "session1"],
+        SimpleNamespace(num_blocks=100, block_len=100),
+    )
+    compute_calls = []
+
+    def compute_offsets(layer_name, *_args):
+        compute_calls.append(layer_name)
+        if layer_name == "layer0":
+            return [10], [20], [1]
+        return [30], [40], [2]
+
+    worker._compute_block_transfer_offsets = compute_offsets
+    worker.moriio_wrapper.read_results = [
+        FakeStatus(succeeded=True),
+        FakeStatus(succeeded=True),
+    ]
+
+    worker._read_blocks(
+        local_block_ids=[11, 12],
+        remote_block_ids=[21, 22],
+        dst_engine_id="remote",
+        request_id="req0",
+        transfer_id="transfer0",
+        remote_host="host",
+        remote_notify_port=61005,
+        remote_dp_rank=1,
+        remote_tp_size=16,
+    )
+
+    assert compute_calls == ["layer0", "layer1"]
+    assert worker.moriio_wrapper.read_calls == [
+        ([1], [10], [20], "session0"),
+        ([2], [30], [40], "session1"),
+    ]
 
 
 def test_read_blocks_partial_setup_exception_marks_local_blocks_invalid() -> None:

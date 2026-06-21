@@ -1057,11 +1057,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_AITER_MLA_PERSISTENT_METADATA", "False").lower()
         in ("true", "1")
     ),
-    # Force MTP verification decode to split each qlen>1 request into qlen=1
-    # rows before calling AITER MLA. This is a correctness fallback for
-    # deployments where native causal qlen>1 persistent metadata is not stable,
-    # but it is off by default because it multiplies high-concurrency decode
-    # metadata and KV-prefix work by the MTP query length.
+    # Whether to lower MTP verification decode rows to qlen=1 before AITER
+    # MLA. This avoids native qlen>1 persistent metadata paths on deployments
+    # where the gfx942 qh128 AITER kernel is unstable.
     "VLLM_AITER_MLA_MTP_DECODE_SPLIT": lambda: (
         os.getenv("VLLM_AITER_MLA_MTP_DECODE_SPLIT", "False").lower()
         in ("true", "1")
