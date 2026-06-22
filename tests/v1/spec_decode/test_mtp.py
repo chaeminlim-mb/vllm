@@ -28,6 +28,7 @@ from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 
 mimo_7b_dir = "XiaomiMiMo/MiMo-7B-Base"
 DEVICE_TYPE = current_platform.device_type
@@ -103,6 +104,50 @@ def test_deepseek_mtp_local_argmax_honors_spec_step_idx():
 
         assert torch.equal(actual, expected)
         assert torch.equal(actual, torch.full_like(actual, expected_token_id))
+
+
+def test_step3p5_mtp_sampler_passes_spec_step_idx_to_local_argmax():
+    proposer = Step3p5MTPProposer.__new__(Step3p5MTPProposer)
+    proposer._enable_probabilistic_draft_probs = False
+    proposer.use_local_argmax_reduction = True
+    proposer.model = mock.MagicMock()
+    hidden_states = torch.zeros(2, 4)
+    expected = torch.tensor([3, 5])
+
+    proposer.model.get_top_tokens.return_value = expected
+    actual, draft_probs = proposer._sample_draft_tokens_for_step(
+        hidden_states, mock.MagicMock(all_greedy=True), spec_step_idx=3
+    )
+
+    (sampled_hidden_states,), sample_kwargs = (
+        proposer.model.get_top_tokens.call_args
+    )
+    assert sampled_hidden_states is hidden_states
+    assert sample_kwargs == {"spec_step_idx": 3}
+    assert torch.equal(actual, expected)
+    assert draft_probs is None
+
+
+def test_step3p5_mtp_sampler_passes_spec_step_idx_to_compute_logits():
+    proposer = Step3p5MTPProposer.__new__(Step3p5MTPProposer)
+    proposer._enable_probabilistic_draft_probs = False
+    proposer.use_local_argmax_reduction = False
+    proposer.model = mock.MagicMock()
+    hidden_states = torch.zeros(2, 4)
+    logits = torch.tensor([[0.0, 1.0, 2.0], [4.0, 3.0, 2.0]])
+
+    proposer.model.compute_logits.return_value = logits
+    actual, draft_probs = proposer._sample_draft_tokens_for_step(
+        hidden_states, mock.MagicMock(all_greedy=True), spec_step_idx=4
+    )
+
+    (sampled_hidden_states,), sample_kwargs = (
+        proposer.model.compute_logits.call_args
+    )
+    assert sampled_hidden_states is hidden_states
+    assert sample_kwargs == {"spec_step_idx": 4}
+    assert torch.equal(actual, torch.tensor([2, 0]))
+    assert draft_probs is None
 
 
 def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:

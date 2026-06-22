@@ -6,9 +6,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import vllm.envs as envs
-from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.attention.backends.mla.rocm_aiter_mla import AiterMLAMetadataBuilder
+import vllm.envs as envs  # noqa: E402
+from vllm.v1.attention.backend import AttentionCGSupport  # noqa: E402
+from vllm.v1.attention.backends.mla.rocm_aiter_mla import (  # noqa: E402
+    AiterMLAMetadataBuilder,
+)
 
 
 @pytest.fixture(autouse=True)

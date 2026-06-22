@@ -36,8 +36,7 @@ logger = init_logger(__name__)
 def _fp8_mla_prefill_supported() -> bool:
     """Auto-detect FP8 MLA prefill via mla_prefill_ps_asm_fwd + mla_reduce_v1.
 
-    Requires gfx950 plus an AITER build that exports both kernels.  When
-    either is missing we silently fall back to ``flash_attn_varlen_func``.
+    Falls back to ``flash_attn_varlen_func`` when the kernels are unavailable.
     """
     try:
         from vllm.platforms.rocm import on_gfx950
@@ -146,9 +145,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
     )
     # MTP verification presents uniform qlen>1 decode batches. AITER's dense
     # MLA decode path supports those batches when vLLM supplies causal
-    # persistent metadata, so keep the native row layout by default. A qlen=1
-    # split fallback remains available for deployments that still need the old
-    # correctness workaround.
+    # persistent metadata, so keep the native row layout by default.
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.SINGLE_ONLY
 
     @classmethod
@@ -282,14 +279,12 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
 
         # Cache the persistent-metadata opt-in at builder init so the hot
         # `_build_decode` path does not read the environment per batch.
-        # See VLLM_AITER_MLA_PERSISTENT_METADATA in vllm.envs for the
-        # warmup fault that keeps ordinary qlen=1 decode opt-in.
         self._use_persistent_metadata: bool = envs.VLLM_AITER_MLA_PERSISTENT_METADATA
 
-        # Store the kernel block size from the spec. When kernel_block_size=1
-        # (no spec-dec), behavior is identical to the original. When > 1
-        # (e.g. 16 with Eagle3), we expand block-level indices into per-token
-        # flat indices since the aiter kernel always uses page_size=1 internally.
+        # Store the kernel block size from the spec. When kernel_block_size=1,
+        # block-level indices already map to flat token indices. When > 1
+        # (e.g. 16 with Eagle3), expand block-level indices because the aiter
+        # kernel always uses page_size=1 internally.
         self.kernel_block_size = kv_cache_spec.block_size
 
         # In the flat view (.view(-1,1,1,H)), each token is its own page,
@@ -697,8 +692,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             max_qo_len = 1
         else:
             # Expand block_table entries into per-token flat indices.
-            # When kernel_block_size=1, this degrades to a direct copy (identical
-            # to the original _copy_page_indices_kernel).
+            # When kernel_block_size=1, block IDs already equal flat token
+            # indices.
             # When kernel_block_size=K>1, block_table entry b covering K tokens
             # gets expanded to flat indices b*K, b*K+1, ..., b*K+(K-1).
             _expand_page_indices_kernel[(num_reqs,)](
@@ -769,10 +764,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                     qo_indptr = query_start_loc_device[: 1 + num_kernel_reqs]
 
         # For native MTP verification (qlen>1), pass persistent metadata so
-        # AITER gets explicit causal boundaries for each request instead of
-        # relying on the non-persistent qlen path. For ordinary qlen=1 decode,
-        # keep persistent metadata opt-in because the historical gfx942 qh128
-        # path could fault during warmup on some deployments.
+        # AITER gets explicit causal boundaries for each request. For ordinary
+        # qlen=1 decode, keep persistent metadata opt-in.
         has_persistent_metadata = False
         use_persistent_metadata = (
             max_qo_len > 1
@@ -865,8 +858,7 @@ def _expand_page_indices_kernel(
     block-level indices from the block table into individual token positions
     in the flattened KV buffer.
 
-    When KERNEL_BLOCK_SIZE=1: block_idx=t, offset=0, flat=block_id
-    (equivalent to a direct copy -- no regression from the original kernel).
+    When KERNEL_BLOCK_SIZE=1: block_idx=t, offset=0, flat=block_id.
 
     When KERNEL_BLOCK_SIZE=K: block table entry b (covering K tokens)
     is expanded to flat indices b*K, b*K+1, ..., b*K+(K-1).
@@ -1031,8 +1023,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
         self.flash_attn_varlen_func = flash_attn_varlen_func
 
-        # FP8 MLA prefill kernel imports (lazy, only when enabled).
-        # Auto-enabled on gfx950 when AITER ships the kernels.
+        # FP8 MLA prefill kernel imports are lazy and only used when supported.
         self._fp8_prefill_enabled = _fp8_mla_prefill_supported()
         if self._fp8_prefill_enabled:
             from aiter import mla_prefill_ps_asm_fwd, mla_reduce_v1
@@ -1106,7 +1097,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
         # Per-call scratch (logits, attn_lse, final_lse) is served from the
         # workspace manager so allocator churn in the prefill hot path is
-        # bounded after warmup, matching the pattern in PR #41002.
+        # bounded after warmup.
         logits, attn_lse, final_lse = current_workspace_manager().get_simultaneous(
             ((num_partial_tiles * tile_q, nhead, v_head_dim), torch.float32),
             ((num_partial_tiles * tile_q, nhead), torch.float32),
@@ -1247,8 +1238,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         ):
             # MTP verification can call the AITER MLA decode kernel with
             # qlen > 1. If that path is running without persistent metadata,
-            # preserve the old zero-fill guard so unwritten lanes cannot leak
-            # into logits.
+            # zero-fill so unwritten lanes cannot leak into logits.
             o.zero_()
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
