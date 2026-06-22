@@ -1215,6 +1215,7 @@ def test_relaxed_thinking_scheduler_hands_boundary_ids_to_cached_request_data():
     scheduler.think_start_token_id = 10
     scheduler.think_end_token_id = 11
     scheduler.use_pp = False
+    scheduler.use_v2_model_runner = False
     class SchedulerConfigStub:
         async_scheduling = False
 
