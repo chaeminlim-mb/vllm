@@ -350,7 +350,6 @@ def rocm_aiter_fused_experts(
             if moe_config.intermediate_pad is None
             else moe_config.intermediate_pad
         )
-
         # Round hidden_pad/intermediate_pad to match AITER's CK/FlyDSL MoE
         # dispatch (currently pinned to v0.1.13.post1):
         # https://github.com/ROCm/aiter/blob/v0.1.13.post1/aiter/fused_moe.py#L1073
@@ -560,19 +559,12 @@ class AiterExperts(mk.FusedMoEExpertsModular):
 
 
 class AiterBatchedExpertsFp8(mk.FusedMoEExpertsModular):
-    """Run AITER FP8 fused MoE with ``BatchedExperts`` activations.
+    """Adapt BatchedExperts FP8 activations to Standard-layout AITER.
 
-    ``BatchedExperts`` prepare steps produce activations shaped
-    ``(E_local, M_e, K)``: tokens are already grouped by local expert, and
-    padding after each expert's valid token prefix may be present. This wrapper
-    flattens that layout to ``(E_local * M_e, K)``, builds local synthetic
-    expert ids ``0..E_local-1``, and delegates to the existing Standard-layout
-    AITER FP8 kernel.
-
-    The output tensor is provided as ``(E_local, M_e, K)``. A flattened view is
-    passed to the inner kernel, so the kernel writes directly into the runtime
-    output buffer. Router weights and reduction remain owned by the surrounding
-    ``BatchedExperts`` prepare/finalize path.
+    Invariant: ``hidden_states`` and ``output`` are shaped
+    ``(E_local, M_e, K)``. The outer BatchedExperts pipeline still owns the
+    per-expert ``expert_tokens_meta`` for finalization; the inner Standard
+    AITER kernel only sees flat synthetic rows.
     """
 
     def __init__(
@@ -588,10 +580,8 @@ class AiterBatchedExpertsFp8(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
-        # Build an inner Standard-layout AITER experts instance to delegate to.
-        # We intentionally pass *no* max_num_tokens / num_dispatchers to the
-        # inner (Standard) experts, since AiterExperts (Standard) asserts
-        # those must be None — see FusedMoEExperts.__init__ in modular_kernel.py.
+        # The inner Standard-layout expert does not own batched runtime
+        # metadata; max_num_tokens and num_dispatchers stay on this wrapper.
         self._inner = AiterExperts(
             moe_config=moe_config,
             quant_config=quant_config,
@@ -659,10 +649,7 @@ class AiterBatchedExpertsFp8(mk.FusedMoEExpertsModular):
         )
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
-        # Let the BatchedExperts prepare/finalize handle topk weight
-        # application + reduction. This matches the
-        # behavior of every other BatchedExperts implementation in tree
-        # (BatchedTritonExperts, CutlassBatchedExpertsFp8, NaiveBatchedExperts).
+        # BatchedExperts prepare/finalize owns topk weighting and reduction.
         return TopKWeightAndReduceDelegate()
 
     def workspace_shapes(
@@ -676,11 +663,8 @@ class AiterBatchedExpertsFp8(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        # AITER manages its own internal workspaces (kernel-side), so the
-        # only buffer we need the modular kernel runtime to allocate for us
-        # is the fused-output tensor itself, which for BatchedExperts must
-        # be shaped (E_local, M_e_total, K) — see e.g.
-        # NaiveBatchedExperts.workspace_shapes.
+        # AITER owns kernel-side workspaces. The modular runtime only needs
+        # the batched output buffer.
         assert self.num_dispatchers is not None
         assert self.max_num_tokens is not None
         num_dp = self.num_dispatchers
@@ -741,9 +725,8 @@ class AiterBatchedExpertsFp8(mk.FusedMoEExpertsModular):
         flat_in = hidden_states.reshape(E_local * M_e, K)
         flat_out = output.view(E_local * M_e, K)
 
-        # 2) Build synthetic per-flattened-token routing.
-        # Tokens [i*M_e, (i+1)*M_e) -> local expert i.
-
+        # Synthetic routing maps each flattened expert segment to its local
+        # expert id.
         synth_ids = (
             torch.arange(E_local, device=device, dtype=torch.int32)
             .repeat_interleave(M_e)
@@ -754,16 +737,11 @@ class AiterBatchedExpertsFp8(mk.FusedMoEExpertsModular):
             (E_local * M_e, 1), device=device, dtype=torch.float32
         )
 
-        # 3) Padding slots remain in the flattened stream. The Standard AITER
-        # kernel computes every row, including rows beyond
-        # expert_num_tokens[i]. BatchedExperts finalizers combine only the
-        # valid prefix for each expert, so those padded outputs are ignored.
+        # The Standard kernel computes padded rows too; finalization ignores
+        # rows past each expert's valid prefix.
 
-        # 4) Handle quantization-scale layouts. The BatchedExperts producers
-        # ship per-block scales shaped (E_local, M_e, K/block_k) or per-tensor
-        # (1,) or per-token (E_local, M_e, 1). The inner AITER kernel expects
-        # 2-D scales matching the *flattened* activation layout
-        # (E_local * M_e, K/block_k) or (E_local * M_e, 1).
+        # BatchedExperts producers may provide per-block/per-token scales with
+        # the batched leading dimensions. Flatten them to match flat_in.
         flat_a1q_scale: torch.Tensor | None = None
         if a1q_scale is not None:
             if a1q_scale.dim() == 3:
@@ -774,9 +752,7 @@ class AiterBatchedExpertsFp8(mk.FusedMoEExpertsModular):
                 # Scalar / per-tensor: leave untouched, AITER handles it.
                 flat_a1q_scale = a1q_scale
 
-        # 5) Delegate to the Standard-layout AITER kernel. The inner apply()
-        # writes into `flat_out`, which is a view of `output`, so no copy
-        # back is needed.
+        # Delegate without a copyback: flat_out aliases output.
         self._inner.apply(
             output=flat_out,
             hidden_states=flat_in,
@@ -793,8 +769,10 @@ class AiterBatchedExpertsFp8(mk.FusedMoEExpertsModular):
             a2_scale=a2_scale,
             workspace13=workspace13,
             workspace2=workspace2,
-            # The flattened layout is contiguous per expert, so
-            # expert_num_tokens keeps its per-expert semantics.
-            expert_tokens_meta=expert_tokens_meta,
+            # Standard AITER treats expert_tokens_meta as a flat row limit.
+            # The flattened batched layout keeps padded rows in each expert
+            # slab and combine ignores them, so passing per-expert counts would
+            # make the inner kernel skip valid rows from later experts.
+            expert_tokens_meta=None,
             apply_router_weight_on_input=False,
         )

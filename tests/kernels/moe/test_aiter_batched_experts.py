@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit-level tests for the AITER ``BatchedExperts`` FP8 wrapper.
 
-These tests guard the reshape and oracle-selection contracts without requiring
-the AITER runtime:
+These tests guard reshape and oracle-selection contracts without invoking
+AITER kernels. The wrapper test still runs through the real ``AiterExperts``
+adapter and monkeypatches only the final AITER kernel call.
+Covered contracts:
 
   * the wrapper advertises ``BatchedExperts`` activation format,
   * BatchedExperts prepare/finalize can provide already-quantized activations,
@@ -17,19 +19,49 @@ from types import SimpleNamespace
 
 import torch
 
-import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-import vllm.model_executor.layers.fused_moe.oracle.fp8 as fp8_oracle
-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+import vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe as rocm_aiter_moe  # noqa: E501
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk  # noqa: E402
+import vllm.model_executor.layers.fused_moe.oracle.fp8 as fp8_oracle  # noqa: E402
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation  # noqa: E402
+from vllm.model_executor.layers.fused_moe.config import (  # noqa: E402
+    FUSED_MOE_UNQUANTIZED_CONFIG,
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    RoutingMethodType,
+)
+from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (  # noqa: E402
     AiterBatchedExpertsFp8,
     AiterExperts,
 )
-from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+from vllm.model_executor.layers.fused_moe.oracle.fp8 import (  # noqa: E402
     Fp8MoeBackend,
     _get_priority_backends,
     backend_to_kernel_cls,
     select_fp8_moe_backend,
 )
+
+
+def _make_moe_config(
+    *,
+    num_experts: int,
+    hidden_dim: int,
+    intermediate_size: int,
+    max_num_tokens: int,
+) -> FusedMoEConfig:
+    return FusedMoEConfig(
+        num_experts=num_experts,
+        experts_per_token=1,
+        hidden_dim=hidden_dim,
+        intermediate_size=intermediate_size,
+        num_local_experts=num_experts,
+        num_logical_experts=num_experts,
+        activation=MoEActivation.SILU,
+        device="cpu",
+        routing_method=RoutingMethodType.Default,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        in_dtype=torch.float32,
+        max_num_tokens=max_num_tokens,
+    )
 
 
 def test_aiter_batched_experts_fp8_activation_format():
@@ -58,20 +90,10 @@ def test_aiter_batched_experts_does_not_expect_unquantized_inputs():
     assert fget(object.__new__(AiterBatchedExpertsFp8)) is False
 
 
-def test_aiter_batched_experts_flattens_batched_layout_for_inner_aiter():
-    """CPU-constructible check for the batched-to-flat wrapper contract."""
-
-    class CapturingInner:
-        def __init__(self):
-            self.kwargs = None
-
-        def apply(self, **kwargs):
-            self.kwargs = kwargs
-            output = kwargs["output"]
-            hidden_states = kwargs["hidden_states"]
-            topk_ids = kwargs["topk_ids"].to(dtype=output.dtype)
-            output.copy_(hidden_states[:, : output.size(-1)] + topk_ids)
-
+def test_aiter_batched_experts_flattens_batched_layout_for_inner_aiter(
+    monkeypatch,
+):
+    """Check the batched-to-flat wrapper contract without invoking kernels."""
     E_local = 2
     M_e = 3
     K = 4
@@ -84,10 +106,29 @@ def test_aiter_batched_experts_flattens_batched_layout_for_inner_aiter():
     )
     a2_scale = torch.tensor([0.5])
     expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list([2, 1], "cpu")
+    captured = {}
 
-    inner = CapturingInner()
-    wrapper = object.__new__(AiterBatchedExpertsFp8)
-    wrapper._inner = inner
+    def fake_rocm_aiter_fused_experts(**kwargs):
+        captured.update(kwargs)
+        routed_ids = kwargs["topk_ids"].to(dtype=kwargs["hidden_states"].dtype)
+        return kwargs["hidden_states"] + routed_ids
+
+    monkeypatch.setattr(
+        rocm_aiter_moe,
+        "rocm_aiter_fused_experts",
+        fake_rocm_aiter_fused_experts,
+    )
+    wrapper = AiterBatchedExpertsFp8(
+        _make_moe_config(
+            num_experts=E_local,
+            hidden_dim=K,
+            intermediate_size=1,
+            max_num_tokens=M_e,
+        ),
+        FUSED_MOE_UNQUANTIZED_CONFIG,
+        max_num_tokens=M_e,
+        num_dispatchers=1,
+    )
 
     wrapper.apply(
         output=output,
@@ -107,25 +148,23 @@ def test_aiter_batched_experts_flattens_batched_layout_for_inner_aiter():
         apply_router_weight_on_input=True,
     )
 
-    assert inner.kwargs is not None
-    kwargs = inner.kwargs
-    assert kwargs["apply_router_weight_on_input"] is False
     expected_ids = torch.tensor([[0], [0], [0], [1], [1], [1]], dtype=torch.int32)
 
-    assert kwargs["hidden_states"].shape == (E_local * M_e, K)
-    assert torch.equal(kwargs["hidden_states"], hidden_states.reshape(E_local * M_e, K))
-    assert kwargs["output"].shape == (E_local * M_e, K)
-    assert kwargs["output"].data_ptr() == output.reshape(E_local * M_e, K).data_ptr()
-    assert torch.equal(kwargs["topk_ids"], expected_ids)
-    assert torch.equal(kwargs["topk_weights"], torch.ones(E_local * M_e, 1))
-    assert kwargs["global_num_experts"] == E_local
-    assert kwargs["expert_map"] is None
-    assert torch.equal(kwargs["a1q_scale"], a1q_scale.reshape(E_local * M_e, 2))
-    assert kwargs["a2_scale"] is a2_scale
-    assert kwargs["expert_tokens_meta"] is expert_tokens_meta
+    assert captured["hidden_states"].shape == (E_local * M_e, K)
+    assert torch.equal(
+        captured["hidden_states"], hidden_states.reshape(E_local * M_e, K)
+    )
+    assert torch.equal(captured["topk_ids"], expected_ids)
+    assert torch.equal(captured["topk_weights"], torch.ones(E_local * M_e, 1))
+    assert captured["moe_config"].num_experts == E_local
+    assert captured["expert_map"] is None
+    assert torch.equal(captured["a1q_scale"], a1q_scale.reshape(E_local * M_e, 2))
+    assert captured["num_local_tokens"] is None
 
     expected_output = hidden_states.reshape(E_local * M_e, K) + expected_ids.float()
     assert torch.equal(output, expected_output.reshape(E_local, M_e, K))
+
+
 
 
 def test_oracle_registers_batched_aiter_backend():
@@ -173,8 +212,7 @@ def test_select_fp8_moe_backend_routes_batched_aiter_env_to_wrapper(monkeypatch)
 
 
 def test_oracle_priority_order_places_batched_aiter_before_fallbacks():
-    # The helper can reshuffle for Hopper/XPU/CPU, but it only needs these
-    # fields from the config object for the ROCm/default order we check here.
+    # Only these fields are needed for the ROCm/default priority order checked here.
     moe_config = SimpleNamespace(
         moe_parallel_config=SimpleNamespace(
             use_deepep_v2_kernels=False,
