@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import math
 import pickle
 import sys
 import threading
@@ -639,21 +640,28 @@ class MessageQueue:
 
         def timeout_ms(self) -> int | None:
             """Returns a timeout that is:
-            - reader recheck interval if the timeout is None
-            - min(time to deadline, reader recheck interval) if timeout is set
+            - min(next warning, reader recheck interval) if timeout is None
+            - min(time to deadline, next warning, reader recheck interval) if
+              timeout is set
             - raise TimeoutError if we are past the deadline
             """
-            if self.timeout is None:
-                return self.recheck_interval_ms
+            timeout_ms = self.recheck_interval_ms
+            if self._should_warn:
+                elapsed = time.monotonic() - self.started
+                next_warning_s = (
+                    VLLM_RINGBUFFER_WARNING_INTERVAL * self.n_warning - elapsed
+                )
+                next_warning_ms = max(0, math.ceil(next_warning_s * 1000))
+                timeout_ms = min(timeout_ms, next_warning_ms)
 
-            time_left_ms = int((self.deadline - time.monotonic()) * 1000)
+            if self.timeout is None:
+                return timeout_ms
+
+            time_left_ms = math.ceil((self.deadline - time.monotonic()) * 1000)
             if time_left_ms <= 0:
                 raise TimeoutError
 
-            if self.recheck_interval_ms < time_left_ms:
-                return self.recheck_interval_ms
-
-            return time_left_ms
+            return min(timeout_ms, time_left_ms)
 
         def should_warn(self) -> bool:
             """Returns true if it's time to log a warning for a timeout that is not
@@ -717,8 +725,8 @@ class MessageQueue:
                     try:
                         yield buf
                     finally:
-                        # caller has read from the buffer
-                        # set the read flag
+                        # The context is exiting: the caller either finished
+                        # reading or raised. Release the slot for the writer.
                         metadata_buffer[self.local_reader_rank + 1] = 1
                         # Memory fence ensures the read flag is visible to the writer.
                         # Without this, writer may not see our read completion and
