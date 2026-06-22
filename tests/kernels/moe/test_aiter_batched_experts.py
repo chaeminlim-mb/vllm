@@ -15,9 +15,18 @@ Covered contracts:
   * the FP8 oracle routes the batched ROCm AITER path to that wrapper.
 """
 
+from importlib.util import find_spec
 from types import SimpleNamespace
 
+import pytest
 import torch
+
+from vllm.platforms import current_platform
+
+if not current_platform.is_rocm():
+    pytest.skip("AITER BatchedExperts tests require ROCm.", allow_module_level=True)
+if find_spec("aiter") is None:
+    pytest.skip("AITER BatchedExperts tests require aiter.", allow_module_level=True)
 
 import vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe as rocm_aiter_moe  # noqa: E501
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk  # noqa: E402
