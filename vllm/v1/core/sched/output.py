@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -124,6 +124,14 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # Per-request thinking phase flag for relaxed acceptance.
+    # Aligned with req_ids. Used by gpu_model_runner to build the
+    # thinking_states tensor passed into the rejection sampler.
+    thinking_states: list[bool] = field(default_factory=list)
+    # Boundary token ids used by the relaxed-thinking sampler to stop a
+    # speculative verification window as soon as a phase boundary is accepted.
+    think_start_token_id: int | None = None
+    think_end_token_id: int | None = None
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -174,6 +182,9 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            thinking_states=[],
+            think_start_token_id=None,
+            think_end_token_id=None,
         )
 
 

@@ -765,6 +765,13 @@ class GPUModelRunner(
         self.num_accepted_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
+        self.thinking_states: CpuGpuBuffer | None = None
+        if self.speculative_config is not None and getattr(
+            self.speculative_config, "relaxed_thinking", False
+        ):
+            self.thinking_states = self._make_buffer(
+                self.max_num_reqs, dtype=torch.bool
+            )
 
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -3583,6 +3590,7 @@ class GPUModelRunner(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        scheduler_output: "SchedulerOutput | None" = None,
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
@@ -3602,11 +3610,57 @@ class GPUModelRunner(
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
+
+        # Reuse a persistent CPU/GPU bool buffer only when a scheduled
+        # request is already in thinking mode. Boundary ids still go to the
+        # sampler so the strict path can truncate an accepted boundary.
+        relaxed_thinking = False
+        relax_ratio = 1.0
+        relax_top_k = 1
+        thinking_states_tensor: torch.Tensor | None = None
+        think_start_token_id: int | None = None
+        think_end_token_id: int | None = None
+        speculative_config = getattr(self, "speculative_config", None)
+        if speculative_config is not None and getattr(
+            speculative_config, "relaxed_thinking", False
+        ):
+            relaxed_thinking = True
+            relax_ratio = speculative_config.relax_ratio
+            relax_top_k = speculative_config.relax_top_k
+            if scheduler_output is not None:
+                cached_req_data = scheduler_output.scheduled_cached_reqs
+                think_start_token_id = cached_req_data.think_start_token_id
+                think_end_token_id = cached_req_data.think_end_token_id
+                if self.thinking_states is not None:
+                    num_reqs = self.input_batch.num_reqs
+                    thinking_states_cpu = self.thinking_states.np
+                    thinking_states_cpu[:num_reqs].fill(False)
+                    has_thinking = False
+                    req_id_to_index = self.input_batch.req_id_to_index
+                    for req_id, thinking_state in zip(
+                        cached_req_data.req_ids, cached_req_data.thinking_states
+                    ):
+                        if not thinking_state:
+                            continue
+                        req_index = req_id_to_index.get(req_id)
+                        if req_index is not None:
+                            thinking_states_cpu[req_index] = True
+                            has_thinking = True
+                    if has_thinking:
+                        self.thinking_states.copy_to_gpu(num_reqs)
+                        thinking_states_tensor = self.thinking_states.gpu[:num_reqs]
+
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,
             logits,
             sampling_metadata,
+            relaxed_thinking=relaxed_thinking,
+            relax_ratio=relax_ratio,
+            relax_top_k=relax_top_k,
+            thinking_states=thinking_states_tensor,
+            think_start_token_id=think_start_token_id,
+            think_end_token_id=think_end_token_id,
         )
         return sampler_output
 
@@ -4468,7 +4522,9 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(
+                logits, spec_decode_metadata, scheduler_output
+            )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -6055,7 +6111,7 @@ class GPUModelRunner(
             # MM Encoder only model no need to run sampler.
             return torch.tensor([])
 
-        hidden_states = torch.rand_like(hidden_states)
+        hidden_states.uniform_()
 
         logits = self.model.compute_logits(hidden_states)
         num_reqs = logits.size(0)

@@ -50,7 +50,12 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
-from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.utils import (
+    check_stop,
+    initial_thinking_state,
+    maybe_update_thinking_state,
+    remove_all,
+)
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -66,6 +71,13 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # Class-level defaults so partially constructed schedulers (upstream
+    # unit tests build instances via object.__new__) take the disabled
+    # path in _update_request_with_output without AttributeError.
+    relaxed_thinking: bool = False
+    think_start_token_id: int | None = None
+    think_end_token_id: int | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -230,6 +242,11 @@ class Scheduler(SchedulerInterface):
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        # Relaxed acceptance defaults off; only the rejection sampler kernel
+        # changes behaviour when self.relaxed_thinking is True.
+        self.relaxed_thinking = False
+        self.think_start_token_id: int | None = None
+        self.think_end_token_id: int | None = None
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -247,6 +264,67 @@ class Scheduler(SchedulerInterface):
                 # decoding instead of standard next-token sampling, so it has a query
                 # for the last sampled token plus queries for each draft token.
                 self.num_lookahead_tokens = self.num_spec_tokens + 1
+            if getattr(speculative_config, "relaxed_thinking", False):
+                self.relaxed_thinking = True
+                relax_ratio = speculative_config.relax_ratio
+                relax_top_k = speculative_config.relax_top_k
+                if not (0 < relax_ratio <= 1):
+                    raise ValueError(
+                        "relax_ratio must be in (0, 1] when relaxed_thinking "
+                        f"is enabled, got {relax_ratio}."
+                    )
+                if not speculative_config.reasoning_parser:
+                    raise ValueError(
+                        "reasoning_parser must be set when relaxed_thinking is enabled."
+                    )
+                logger.info(
+                    "Enable relaxed thinking, relax_ratio=%s, relax_top_k=%s",
+                    relax_ratio,
+                    relax_top_k,
+                )
+                from vllm.reasoning import ReasoningParserManager
+                from vllm.tokenizers import cached_tokenizer_from_config
+
+                model_config = vllm_config.model_config
+                tokenizer_kwargs: dict[str, Any] = {
+                    "download_dir": vllm_config.load_config.download_dir,
+                }
+                if model_config.hf_token is not None:
+                    tokenizer_kwargs["token"] = model_config.hf_token
+                tokenizer = cached_tokenizer_from_config(
+                    model_config, **tokenizer_kwargs
+                )
+                if tokenizer is None:
+                    raise ValueError(
+                        "skip_tokenizer_init cannot be used when "
+                        "relaxed_thinking is enabled."
+                    )
+                parser_cls = ReasoningParserManager.get_reasoning_parser(
+                    speculative_config.reasoning_parser
+                )
+                if parser_cls is None:
+                    raise TypeError(
+                        f"reasoning_parser '{speculative_config.reasoning_parser}'"
+                        " has not been registered."
+                    )
+                parser = parser_cls(tokenizer)
+                logger.info("Use reasoning parser: %s", parser)
+                if hasattr(parser, "start_token_id") and hasattr(
+                    parser, "end_token_id"
+                ):
+                    self.think_start_token_id = parser.start_token_id
+                    self.think_end_token_id = parser.end_token_id
+                elif hasattr(parser, "think_start_token_id") and hasattr(
+                    parser, "think_end_token_id"
+                ):
+                    self.think_start_token_id = parser.think_start_token_id
+                    self.think_end_token_id = parser.think_end_token_id
+                else:
+                    raise AttributeError(
+                        "Reasoning parser must expose (start_token_id, "
+                        "end_token_id) or (think_start_token_id, "
+                        "think_end_token_id) attributes."
+                    )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -1238,6 +1316,7 @@ class Scheduler(SchedulerInterface):
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
+        self._initialize_request_thinking_state(session)
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
@@ -1256,6 +1335,7 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        thinking_states: list[bool] = []
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1290,6 +1370,10 @@ class Scheduler(SchedulerInterface):
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
             )
+            # Empty when relaxed acceptance is disabled so downstream code can
+            # keep the standard rejection-sampling fast path.
+            if self.relaxed_thinking:
+                thinking_states.append(req.thinking_state)
 
         return CachedRequestData(
             req_ids=req_ids,
@@ -1299,6 +1383,13 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            thinking_states=thinking_states,
+            think_start_token_id=(
+                self.think_start_token_id if self.relaxed_thinking else None
+            ),
+            think_end_token_id=(
+                self.think_end_token_id if self.relaxed_thinking else None
+            ),
         )
 
     def _try_schedule_encoder_inputs(
@@ -1834,6 +1925,16 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
+    def _initialize_request_thinking_state(self, request: Request) -> None:
+        if not self.relaxed_thinking:
+            return
+        request.thinking_state = initial_thinking_state(
+            prompt_token_ids=request.prompt_token_ids,
+            reasoning_ended=request.reasoning_ended,
+            think_start_token_id=self.think_start_token_id,
+            think_end_token_id=self.think_end_token_id,
+        )
+
     def _enqueue_waiting_request(self, request: Request) -> None:
         if self._is_blocked_waiting_status(request.status):
             self.skipped_waiting.add_request(request)
@@ -1878,6 +1979,13 @@ class Scheduler(SchedulerInterface):
         # to return empty token ids for the request.
         stopped = False
         for num_new, output_token_id in enumerate(new_token_ids, 1):
+            if self.relaxed_thinking:
+                maybe_update_thinking_state(
+                    request=request,
+                    new_token_id=output_token_id,
+                    think_start_token_id=self.think_start_token_id,
+                    think_end_token_id=self.think_end_token_id,
+                )
             request.append_output_token_ids(output_token_id)
 
             # Check for stop and update request state.
@@ -2002,6 +2110,7 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            self._initialize_request_thinking_state(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:

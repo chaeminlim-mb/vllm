@@ -864,6 +864,106 @@ def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
     assert torch.equal(passed_draft_probs, expected_draft_probs)
 
 
+def test_sample_passes_relaxed_boundaries_and_thinking_states():
+    class FakeThinkingStates:
+        def __init__(self):
+            self.np = np.empty(2, dtype=np.bool_)
+            self.gpu = torch.empty(2, dtype=torch.bool)
+            self.copied_num_reqs: int | None = None
+
+        def copy_to_gpu(self, num_reqs: int):
+            self.copied_num_reqs = num_reqs
+            self.gpu[:num_reqs] = torch.from_numpy(self.np[:num_reqs])
+
+    class FakeRejectionSampler:
+        def __init__(self):
+            self.args = ()
+            self.kwargs = {}
+
+        def __call__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+            return "sampler_output"
+
+        def reset(self):
+            self.args = ()
+            self.kwargs = {}
+
+    req_ids = ["req_a", "req_b"]
+    runner = object.__new__(GPUModelRunner)
+    runner.use_async_scheduling = False
+    runner.input_batch = SimpleNamespace(
+        sampling_metadata=object(),
+        update_async_output_token_ids=lambda: None,
+        req_ids=req_ids,
+        num_reqs=len(req_ids),
+        req_id_to_index={req_id: idx for idx, req_id in enumerate(req_ids)},
+    )
+    runner.rejection_sampler = FakeRejectionSampler()
+    runner.sampler = object()
+    runner._draft_prob_req_ids = None
+    runner._draft_probs = None
+    runner.speculative_config = SimpleNamespace(
+        relaxed_thinking=True,
+        relax_ratio=0.8,
+        relax_top_k=2,
+    )
+    runner.thinking_states = FakeThinkingStates()
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(
+            req_ids=req_ids,
+            resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={},
+            new_block_ids=[None, None],
+            num_computed_tokens=[1, 1],
+            num_output_tokens=[1, 1],
+            thinking_states=[False, False],
+            think_start_token_id=10,
+            think_end_token_id=11,
+        ),
+        num_scheduled_tokens={req_id: 1 for req_id in req_ids},
+        total_num_scheduled_tokens=len(req_ids),
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    spec_decode_metadata = SpecDecodeMetadata.make_dummy(
+        [[10], [3]], device=torch.device("cpu")
+    )
+    logits = torch.randn(2, 4)
+
+    output = GPUModelRunner._sample(
+        runner, logits, spec_decode_metadata, scheduler_output
+    )
+
+    assert output == "sampler_output"
+    kwargs = runner.rejection_sampler.kwargs
+    assert kwargs["relaxed_thinking"] is True
+    assert kwargs["think_start_token_id"] == 10
+    assert kwargs["think_end_token_id"] == 11
+    assert runner.thinking_states.copied_num_reqs is None
+    assert kwargs["thinking_states"] is None
+
+    runner.rejection_sampler.reset()
+    scheduler_output.scheduled_cached_reqs.thinking_states = [False, True]
+    output = GPUModelRunner._sample(
+        runner, logits, spec_decode_metadata, scheduler_output
+    )
+
+    assert output == "sampler_output"
+    kwargs = runner.rejection_sampler.kwargs
+    assert kwargs["think_start_token_id"] == 10
+    assert kwargs["think_end_token_id"] == 11
+    assert runner.thinking_states.copied_num_reqs == len(req_ids)
+    assert torch.equal(
+        kwargs["thinking_states"], torch.tensor([False, True], dtype=torch.bool)
+    )
+
+
 def test_apply_sparse_weight_patches_updates_only_selected_entries():
     class DummyModel(nn.Module):
         def __init__(self):

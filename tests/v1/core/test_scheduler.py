@@ -28,7 +28,7 @@ from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import FinishReason
+from vllm.v1.engine import EngineCoreRequest, FinishReason
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -1207,6 +1207,112 @@ def test_spec_decoding_stats_empty_output():
         engine_core_outputs[0].scheduler_stats if engine_core_outputs else None
     )
     assert scheduler_stats is None or scheduler_stats.spec_decoding_stats is None
+
+
+def test_relaxed_thinking_scheduler_hands_boundary_ids_to_cached_request_data():
+    scheduler = object.__new__(Scheduler)
+    scheduler.relaxed_thinking = True
+    scheduler.think_start_token_id = 10
+    scheduler.think_end_token_id = 11
+    scheduler.use_pp = False
+    class SchedulerConfigStub:
+        async_scheduling = False
+
+    scheduler.scheduler_config = SchedulerConfigStub()
+    scheduler.prev_step_scheduled_req_ids = set()
+    scheduler.max_model_len = 128
+
+    class FakeBlocks:
+        def get_block_ids(self, allow_none: bool = False):
+            return None
+
+    request = create_requests(num_requests=1, num_tokens=1)[0]
+    req_id = request.request_id
+
+    cached_req_data = scheduler._make_cached_request_data(
+        running_reqs=[request],
+        resumed_reqs=[],
+        num_scheduled_tokens={req_id: 1},
+        spec_decode_tokens={},
+        req_to_new_blocks={req_id: FakeBlocks()},
+    )
+    assert cached_req_data.thinking_states == [False]
+    assert cached_req_data.think_start_token_id == 10
+    assert cached_req_data.think_end_token_id == 11
+
+    request.thinking_state = True
+    cached_req_data = scheduler._make_cached_request_data(
+        running_reqs=[request],
+        resumed_reqs=[],
+        num_scheduled_tokens={req_id: 1},
+        spec_decode_tokens={},
+        req_to_new_blocks={req_id: FakeBlocks()},
+    )
+    assert cached_req_data.thinking_states == [True]
+    assert cached_req_data.think_start_token_id == 10
+    assert cached_req_data.think_end_token_id == 11
+
+    scheduler._update_request_with_output(request, [11])
+    assert request.thinking_state is False
+    scheduler._update_request_with_output(request, [10])
+    assert request.thinking_state is True
+
+
+@pytest.mark.parametrize(
+    ("prompt_token_ids", "reasoning_ended", "expected_thinking_state"),
+    [
+        ([1, 2, 3], False, True),
+        ([1, 2, 3], True, False),
+        ([1, 2, 3], None, False),
+        ([10, 1], True, True),
+        ([10, 1, 11], False, False),
+    ],
+)
+def test_relaxed_thinking_scheduler_initializes_from_reasoning_prompt(
+    prompt_token_ids, reasoning_ended, expected_thinking_state
+):
+    scheduler = object.__new__(Scheduler)
+    scheduler.relaxed_thinking = True
+    scheduler.think_start_token_id = 10
+    scheduler.think_end_token_id = 11
+    sampling_params = SamplingParams(max_tokens=16)
+
+    request = Request(
+        request_id="reasoning",
+        prompt_token_ids=prompt_token_ids,
+        sampling_params=sampling_params,
+        pooling_params=None,
+        reasoning_ended=reasoning_ended,
+    )
+
+    scheduler._initialize_request_thinking_state(request)
+
+    assert request.thinking_state is expected_thinking_state
+
+
+def test_relaxed_thinking_engine_request_preserves_reasoning_prompt():
+    scheduler = object.__new__(Scheduler)
+    scheduler.relaxed_thinking = True
+    scheduler.think_start_token_id = 10
+    scheduler.think_end_token_id = 11
+    sampling_params = SamplingParams(max_tokens=16)
+    engine_request = EngineCoreRequest(
+        request_id="reasoning",
+        prompt_token_ids=[1, 2, 3],
+        mm_features=None,
+        sampling_params=sampling_params,
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        reasoning_ended=False,
+    )
+
+    request = Request.from_engine_core_request(engine_request, block_hasher=None)
+    scheduler._initialize_request_thinking_state(request)
+
+    assert request.thinking_state is True
 
 
 def test_no_spec_tokens_scheduled_for_prefill_chunks():

@@ -97,6 +97,12 @@ class Request:
         self.status = RequestStatus.WAITING
         self.events: list[EngineCoreEvent] = []
         self.stop_reason: int | str | None = None
+        # Initial parser state for scheduler-side relaxed-thinking admission.
+        # The scheduler also has the concrete boundary token ids, so it can
+        # resolve prompts whose last token is a boundary more accurately than
+        # this parser-level hint alone.
+        self.reasoning_ended: bool | None = reasoning_ended
+        self.thinking_state: bool = False
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
