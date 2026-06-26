@@ -402,6 +402,17 @@ async def handle_request(api: str, request: Request):
         session, decode_response = await decode_request_task
         stream_generator = stream_decode_response(session, decode_response, request_id)
         response = await make_response(stream_generator)
+        # Propagate the decode engine's Content-Type onto the proxied response.
+        # Without this, Quart make_response() on a generator defaults to
+        # text/html; charset=utf-8, so strict clients (e.g. lm-eval's
+        # response.json(), which enforces the mimetype) reject every response
+        # with ContentTypeError even though the body is valid JSON. The decode
+        # backend returns application/json for non-streaming and
+        # text/event-stream for streaming, so forwarding its header is correct
+        # for both modes.
+        response.headers["Content-Type"] = decode_response.headers.get(
+            "Content-Type", "application/json"
+        )
         return response
     except Exception as e:
         logger.exception("An error occurred while handling the request: %s", e)
