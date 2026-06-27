@@ -7,6 +7,13 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
+from vllm.platforms import current_platform
+
+if not current_platform.is_rocm():
+    pytest.skip("This test can only run on ROCm.", allow_module_level=True)
+
 _PROXY_SERVER = (
     Path(__file__).parents[2]
     / "examples"
