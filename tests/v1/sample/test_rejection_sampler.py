@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ast
 import os
+from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
@@ -183,6 +185,31 @@ def run_relaxed_rejection_sample(
         think_start_token_id=think_start_token_id,
         think_end_token_id=think_end_token_id,
     )
+
+
+def test_relaxed_rejection_triton_kernels_do_not_use_membership_checks():
+    source_path = (
+        Path(__file__).parents[3] / "vllm/v1/sample/rejection_sampler.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    kernel_names = {
+        "rejection_greedy_sample_kernel",
+        "relaxed_thinking_sample_kernel",
+    }
+
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in kernel_names:
+            membership_ops = [
+                op
+                for compare in ast.walk(node)
+                if isinstance(compare, ast.Compare)
+                for op in compare.ops
+                if isinstance(op, ast.In | ast.NotIn)
+            ]
+            assert not membership_ops, (
+                f"{node.name} uses membership comparison, which Triton JIT "
+                "cannot compile in these kernels"
+            )
 
 
 @requires_relaxed_rejection_sample
