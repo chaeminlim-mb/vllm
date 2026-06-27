@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ruff: noqa: E402, I001
 """Unit-level tests for the AITER ``BatchedExperts`` FP8 wrapper.
 
 These tests guard reshape and oracle-selection contracts without invoking
@@ -18,9 +19,24 @@ Covered contracts:
 from types import SimpleNamespace
 
 import pytest
-import torch
+
+from vllm.platforms import current_platform
+
+if not current_platform.is_rocm():
+    pytest.skip(
+        "AITER BatchedExperts tests require ROCm.",
+        allow_module_level=True,
+    )
 
 from vllm._aiter_ops import is_aiter_found_and_supported
+
+if not is_aiter_found_and_supported():
+    pytest.skip(
+        "AITER BatchedExperts tests require supported ROCm AITER.",
+        allow_module_level=True,
+    )
+
+import torch  # noqa: E402
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -40,11 +56,6 @@ from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     _get_priority_backends,
     backend_to_kernel_cls,
     select_fp8_moe_backend,
-)
-
-pytestmark = pytest.mark.skipif(
-    not is_aiter_found_and_supported(),
-    reason="AITER BatchedExperts tests require supported ROCm AITER.",
 )
 
 
