@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -101,6 +102,12 @@ class DraftModelSpeculator(BaseSpeculator):
         self.use_local_argmax_reduction = (
             self.speculative_config.use_local_argmax_reduction
         )
+        self._uses_mtp_spec_step_idx = (
+            self.method == "mtp" and not self.speculative_config.use_gemma4_mtp()
+        )
+        self._forward_accepts_spec_step_idx = False
+        self._compute_logits_accepts_spec_step_idx = False
+        self._get_top_tokens_accepts_spec_step_idx = False
 
         # DP configuration
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -155,6 +162,20 @@ class DraftModelSpeculator(BaseSpeculator):
         )
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
+        self._forward_accepts_spec_step_idx = self._accepts_spec_step_idx(
+            self.model.forward
+        )
+        self._compute_logits_accepts_spec_step_idx = self._accepts_spec_step_idx(
+            self.model.compute_logits
+        )
+        self._get_top_tokens_accepts_spec_step_idx = hasattr(
+            self.model, "get_top_tokens"
+        ) and self._accepts_spec_step_idx(self.model.get_top_tokens)
+        self._uses_mtp_spec_step_idx = self._uses_mtp_spec_step_idx and (
+            self._forward_accepts_spec_step_idx
+            or self._compute_logits_accepts_spec_step_idx
+            or self._get_top_tokens_accepts_spec_step_idx
+        )
         self._validate_local_argmax_reduction()
 
         all_attn_layers = set[str](
@@ -164,6 +185,46 @@ class DraftModelSpeculator(BaseSpeculator):
             ).keys()
         )
         self.draft_attn_layer_names = all_attn_layers - target_attn_layer_names
+
+    @staticmethod
+    def _accepts_spec_step_idx(fn: Any) -> bool:
+        try:
+            parameters = inspect.signature(fn).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.name == "spec_step_idx"
+            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+
+    def _compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int,
+    ) -> torch.Tensor:
+        if (
+            self._uses_mtp_spec_step_idx
+            and self._compute_logits_accepts_spec_step_idx
+        ):
+            return self.model.compute_logits(
+                hidden_states, spec_step_idx=spec_step_idx
+            )
+        return self.model.compute_logits(hidden_states)
+
+    def _get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int,
+    ) -> torch.Tensor:
+        if (
+            self._uses_mtp_spec_step_idx
+            and self._get_top_tokens_accepts_spec_step_idx
+        ):
+            return self.model.get_top_tokens(
+                hidden_states, spec_step_idx=spec_step_idx
+            )
+        return self.model.get_top_tokens(hidden_states)
 
     def set_attn(
         self,
@@ -232,6 +293,14 @@ class DraftModelSpeculator(BaseSpeculator):
                 f"{self.model.__class__.__name__} does not implement "
                 "get_top_tokens()."
             )
+        if (
+            self._uses_mtp_spec_step_idx
+            and not self._get_top_tokens_accepts_spec_step_idx
+        ):
+            raise ValueError(
+                "use_local_argmax_reduction with an MTP draft model requires "
+                "get_top_tokens() to accept spec_step_idx."
+            )
         logger.info(
             "Using local argmax reduction for draft token generation "
             "(communication: O(2*tp_size) vs O(vocab_size))."
@@ -252,9 +321,12 @@ class DraftModelSpeculator(BaseSpeculator):
         seeds: torch.Tensor,
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
+        spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        if draft_logits is None and self.use_local_argmax_reduction:
+            return self._get_top_tokens(hidden_states, spec_step_idx)
+        logits = self._compute_logits(hidden_states, spec_step_idx)
         if draft_logits is not None:
-            logits = self.model.compute_logits(hidden_states)
             # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
             # used for draft and target sampling.
             return gumbel_sample(
@@ -268,7 +340,7 @@ class DraftModelSpeculator(BaseSpeculator):
                 output_processed_logits_col=draft_step,
                 use_fp64=self.use_fp64_gumbel,
             )
-        return self._greedy_sample_draft(hidden_states)
+        return logits.argmax(dim=-1)
 
     def _copy_request_inputs(
         self,

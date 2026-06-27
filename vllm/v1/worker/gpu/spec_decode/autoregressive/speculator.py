@@ -80,16 +80,21 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
-        if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
-            cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+        if self._uses_mtp_spec_step_idx:
+            # DeepSeek-style MTP selects a different Python module per draft
+            # step, so a single captured decode graph cannot be replayed for all
+            # steps without freezing the wrong spec_step_idx.
+            decode_cudagraph_mode = CUDAGraphMode.NONE
+        elif cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
+            decode_cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
         else:
-            cudagraph_mode = CUDAGraphMode.NONE
+            decode_cudagraph_mode = CUDAGraphMode.NONE
 
         # Initialize cudagraph manager for draft decodes (draft positions > 0).
         self.decode_cudagraph_manager = DecodeSpeculatorCudaGraphManager(
             self.vllm_config,
             self.device,
-            cudagraph_mode,
+            decode_cudagraph_mode,
             decode_query_len=1,
         )
 
@@ -287,6 +292,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        spec_step_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
@@ -318,6 +324,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 hidden_states=self.hidden_states[:num_tokens],
                 inputs_embeds=inputs_embeds,
             )
+            if (
+                self._uses_mtp_spec_step_idx
+                and self._forward_accepts_spec_step_idx
+            ):
+                model_inputs["spec_step_idx"] = spec_step_idx
             if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
                 # Draft prefill with PIECEWISE cudagraph (compiled PW or breakable),
                 # chosen inside run_pw_graph.
@@ -356,6 +367,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
+            spec_step_idx=0,
         )
         sample_hidden_states = last_hidden_states[last_token_indices]
 
@@ -367,6 +379,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.seeds,
             self.current_draft_step,
             self.draft_logits,
+            spec_step_idx=0,
         )
         self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
         self.input_buffers.positions[:num_reqs] = positions
@@ -418,6 +431,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     slot_mappings_by_layer,
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=batch_desc.cg_mode,
+                    spec_step_idx=step,
                 )
 
     def _generate_draft(
@@ -428,6 +442,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        spec_step_idx: int = 0,
     ) -> None:
         idx_mapping = self.idx_mapping[:num_reqs]
         positions = self.input_buffers.positions[:num_reqs]
@@ -438,6 +453,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             slot_mappings,
             num_tokens_across_dp,
             cudagraph_runtime_mode,
+            spec_step_idx=spec_step_idx,
         )
         last_hidden_states = last_hidden_states[:num_reqs]
 
@@ -450,6 +466,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.seeds,
             self.current_draft_step,
             self.draft_logits,
+            spec_step_idx=spec_step_idx,
         )
 
         # Update the inputs for the next step.

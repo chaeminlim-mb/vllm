@@ -125,6 +125,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
+    VLLM_AITER_MLA_PERSISTENT_METADATA: bool = False
+    VLLM_AITER_MLA_MTP_DECODE_SPLIT: bool = False
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
@@ -1177,6 +1179,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MLA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MLA", "True").lower() in ("true", "1")
+    ),
+    # Whether to take the persistent qh128 MLA metadata fast path. Disabled by
+    # default so qlen=1 decode uses the regular metadata path unless requested.
+    "VLLM_AITER_MLA_PERSISTENT_METADATA": lambda: (
+        os.getenv("VLLM_AITER_MLA_PERSISTENT_METADATA", "False").lower()
+        in ("true", "1")
+    ),
+    # Force MTP verification decode to split each qlen>1 request into qlen=1
+    # rows before calling AITER MLA. Disabled by default because it multiplies
+    # decode metadata and KV-prefix work by the MTP query length.
+    "VLLM_AITER_MLA_MTP_DECODE_SPLIT": lambda: (
+        os.getenv("VLLM_AITER_MLA_MTP_DECODE_SPLIT", "False").lower() in ("true", "1")
     ),
     # Whether to use aiter mha ops.
     # By default is enabled.
