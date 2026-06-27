@@ -641,12 +641,7 @@ class AiterBatchedExpertsFp8(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
-        # Mirror the FlashInfer exclusion that AiterExperts also applies,
-        # since the inner Standard-layout kernel cannot handle those configs.
-        return not (
-            moe_parallel_config.use_fi_nvl_two_sided_kernels
-            or moe_parallel_config.use_fi_nvl_one_sided_kernels
-        )
+        return moe_parallel_config.use_batched_experts_activation_format
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         # BatchedExperts prepare/finalize owns topk weighting and reduction.
