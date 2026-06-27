@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import Any
 from unittest.mock import Mock
 
@@ -14,12 +15,21 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
+    rejection_sample,
     sample_recovered_tokens,
 )
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 DEVICE_TYPE = current_platform.device_type
+RELAXED_REJECTION_SAMPLE_DEVICE = DEVICE_TYPE or "cpu"
+requires_relaxed_rejection_sample = pytest.mark.skipif(
+    not (
+        current_platform.is_cuda_alike()
+        or os.environ.get("TRITON_INTERPRET") == "1"
+    ),
+    reason="rejection_sample uses Triton CUDA/ROCm kernels",
+)
 
 
 @pytest.fixture
@@ -127,6 +137,233 @@ def create_sampling_metadata(
         bad_words_token_ids={} if bad_words_token_ids is None else bad_words_token_ids,
         logitsprocs=LogitsProcessors(),
     )
+
+
+def run_relaxed_rejection_sample(
+    draft_tokens: list[list[int]],
+    target_logits: torch.Tensor,
+    thinking_states: torch.Tensor | None,
+    *,
+    relaxed_thinking: bool = True,
+    relax_ratio: float = 0.8,
+    relax_top_k: int = 2,
+    think_start_token_id: int | None = None,
+    think_end_token_id: int | None = None,
+) -> torch.Tensor:
+    num_draft_tokens = [len(tokens) for tokens in draft_tokens]
+    cu_values: list[int] = []
+    running_total = 0
+    for num_tokens in num_draft_tokens:
+        running_total += num_tokens
+        cu_values.append(running_total)
+
+    device = target_logits.device
+    draft_token_ids = torch.tensor(
+        [token for tokens in draft_tokens for token in tokens],
+        dtype=torch.int32,
+        device=device,
+    )
+    cu_num_draft_tokens = torch.tensor(cu_values, dtype=torch.int32, device=device)
+    bonus_token_ids = torch.arange(
+        100, 100 + len(draft_tokens), dtype=torch.int32, device=device
+    )
+    return rejection_sample(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        max_spec_len=max(num_draft_tokens),
+        cu_num_draft_tokens=cu_num_draft_tokens,
+        draft_probs=None,
+        target_logits=target_logits,
+        bonus_token_ids=bonus_token_ids,
+        sampling_metadata=create_sampling_metadata(all_greedy=True),
+        relaxed_thinking=relaxed_thinking,
+        relax_ratio=relax_ratio,
+        relax_top_k=relax_top_k,
+        thinking_states=thinking_states,
+        think_start_token_id=think_start_token_id,
+        think_end_token_id=think_end_token_id,
+    )
+
+
+@requires_relaxed_rejection_sample
+def test_relaxed_thinking_false_uses_strict_argmax():
+    target_logits = torch.tensor(
+        [[5.0, 4.9, 1.0, 0.0]],
+        dtype=torch.float32,
+        device=RELAXED_REJECTION_SAMPLE_DEVICE,
+    )
+    thinking_states = torch.tensor([False], device=RELAXED_REJECTION_SAMPLE_DEVICE)
+
+    output = run_relaxed_rejection_sample([[1]], target_logits, thinking_states)
+
+    expected = torch.tensor(
+        [[0, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+        device=RELAXED_REJECTION_SAMPLE_DEVICE,
+    )
+    assert torch.equal(output, expected)
+
+
+@requires_relaxed_rejection_sample
+def test_relaxed_thinking_accepts_topk_token_within_ratio_floor():
+    target_logits = torch.tensor(
+        [[5.0, 4.9, 1.0, 0.0]],
+        dtype=torch.float32,
+        device=RELAXED_REJECTION_SAMPLE_DEVICE,
+    )
+    thinking_states = torch.tensor([True], device=RELAXED_REJECTION_SAMPLE_DEVICE)
+
+    output = run_relaxed_rejection_sample([[1]], target_logits, thinking_states)
+
+    expected = torch.tensor(
+        [[1, 100]], dtype=torch.int32, device=RELAXED_REJECTION_SAMPLE_DEVICE
+    )
+    assert torch.equal(output, expected)
+
+
+@requires_relaxed_rejection_sample
+@pytest.mark.parametrize(
+    "draft_token_id,target_logits",
+    [
+        pytest.param(
+            2,
+            [[5.0, 4.9, 4.85, 0.0]],
+            id="outside-top-k",
+        ),
+        pytest.param(
+            1,
+            [[5.0, 4.7, 1.0, 0.0]],
+            id="below-ratio-floor",
+        ),
+    ],
+)
+def test_relaxed_thinking_rejects_tokens_outside_relaxed_window(
+    draft_token_id, target_logits
+):
+    thinking_states = torch.tensor([True], device=RELAXED_REJECTION_SAMPLE_DEVICE)
+
+    output = run_relaxed_rejection_sample(
+        [[draft_token_id]],
+        torch.tensor(
+            target_logits,
+            dtype=torch.float32,
+            device=RELAXED_REJECTION_SAMPLE_DEVICE,
+        ),
+        thinking_states,
+    )
+
+    expected = torch.tensor(
+        [[0, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+        device=RELAXED_REJECTION_SAMPLE_DEVICE,
+    )
+    assert torch.equal(output, expected)
+
+
+@requires_relaxed_rejection_sample
+@pytest.mark.parametrize("thinking_state_case", ["missing", "misaligned"])
+def test_relaxed_thinking_missing_or_misaligned_states_fall_back_strict(
+    thinking_state_case,
+):
+    target_logits = torch.tensor(
+        [[5.0, 4.9, 1.0, 0.0]],
+        dtype=torch.float32,
+        device=RELAXED_REJECTION_SAMPLE_DEVICE,
+    )
+    thinking_states = (
+        None
+        if thinking_state_case == "missing"
+        else torch.tensor([True, True], device=RELAXED_REJECTION_SAMPLE_DEVICE)
+    )
+
+    output = run_relaxed_rejection_sample([[1]], target_logits, thinking_states)
+
+    expected = torch.tensor(
+        [[0, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+        device=RELAXED_REJECTION_SAMPLE_DEVICE,
+    )
+    assert torch.equal(output, expected)
+
+
+def _relaxed_boundary_logits(
+    rows: list[dict[int, float]], vocab_size: int = 12
+) -> torch.Tensor:
+    logits = torch.full(
+        (len(rows), vocab_size),
+        -100.0,
+        dtype=torch.float32,
+        device=RELAXED_REJECTION_SAMPLE_DEVICE,
+    )
+    for row_idx, values in enumerate(rows):
+        for token_id, value in values.items():
+            logits[row_idx, token_id] = value
+    return logits
+
+
+@requires_relaxed_rejection_sample
+def test_relaxed_thinking_truncates_after_same_window_start_boundary():
+    think_start_token_id = 10
+    think_end_token_id = 11
+    target_logits = _relaxed_boundary_logits(
+        [
+            {think_start_token_id: 5.0},
+            {1: 5.0},
+            {2: 5.0},
+        ]
+    )
+    thinking_states = None
+
+    output = run_relaxed_rejection_sample(
+        [[think_start_token_id, 1, 2]],
+        target_logits,
+        thinking_states,
+        think_start_token_id=think_start_token_id,
+        think_end_token_id=think_end_token_id,
+    )
+
+    expected = torch.tensor(
+        [
+            [
+                think_start_token_id,
+                PLACEHOLDER_TOKEN_ID,
+                PLACEHOLDER_TOKEN_ID,
+                PLACEHOLDER_TOKEN_ID,
+            ]
+        ],
+        dtype=torch.int32,
+        device=RELAXED_REJECTION_SAMPLE_DEVICE,
+    )
+    assert torch.equal(output, expected)
+
+
+@requires_relaxed_rejection_sample
+def test_relaxed_thinking_truncates_after_same_window_end_boundary():
+    think_start_token_id = 10
+    think_end_token_id = 11
+    target_logits = _relaxed_boundary_logits(
+        [
+            {0: 5.0, 5: 4.9},
+            {0: 5.0, think_end_token_id: 4.9},
+            {0: 5.0, 6: 4.9},
+        ]
+    )
+    thinking_states = torch.tensor([True], device=RELAXED_REJECTION_SAMPLE_DEVICE)
+
+    output = run_relaxed_rejection_sample(
+        [[5, think_end_token_id, 6]],
+        target_logits,
+        thinking_states,
+        think_start_token_id=think_start_token_id,
+        think_end_token_id=think_end_token_id,
+    )
+
+    expected = torch.tensor(
+        [[5, think_end_token_id, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+        device=RELAXED_REJECTION_SAMPLE_DEVICE,
+    )
+    assert torch.equal(output, expected)
 
 
 ########################### Tests for Greedy Sampling ###################

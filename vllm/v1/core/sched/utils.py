@@ -128,3 +128,43 @@ def check_stop(request: Request, max_model_len: int) -> bool:
         return True
 
     return False
+
+
+def initial_thinking_state(
+    prompt_token_ids: Sequence[int] | None,
+    reasoning_ended: bool | None,
+    think_start_token_id: int | None = None,
+    think_end_token_id: int | None = None,
+) -> bool:
+    """Return whether relaxed acceptance should start inside thinking.
+
+    Boundary tokens in the prompt are authoritative because some parsers only
+    flip ``reasoning_ended`` on a token after ``</think>``. If the prompt has no
+    known boundary, fall back to the parser's initial state.
+    """
+    if prompt_token_ids is not None and (
+        think_start_token_id is not None or think_end_token_id is not None
+    ):
+        for token_id in reversed(prompt_token_ids):
+            if think_end_token_id is not None and token_id == think_end_token_id:
+                return False
+            if think_start_token_id is not None and token_id == think_start_token_id:
+                return True
+
+    return reasoning_ended is False
+
+
+def maybe_update_thinking_state(
+    request: "Request",
+    new_token_id: int,
+    think_start_token_id: int | None = None,
+    think_end_token_id: int | None = None,
+) -> None:
+    """Flip request.thinking_state on `<think>` / `</think>` token boundaries.
+
+    Called per output token by the scheduler when relaxed_thinking is enabled.
+    """
+    if think_start_token_id is not None and new_token_id == think_start_token_id:
+        request.thinking_state = True
+    if think_end_token_id is not None and new_token_id == think_end_token_id:
+        request.thinking_state = False
