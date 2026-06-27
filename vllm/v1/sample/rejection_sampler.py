@@ -832,9 +832,9 @@ def rejection_greedy_sample_kernel(
                 output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
                 token_id,
             )
-            if accepted and (
-                (draft_token_id == think_start_token_id)
-                or (draft_token_id == think_end_token_id)
+            if accepted and draft_token_id in (
+                think_start_token_id,
+                think_end_token_id,
             ):
                 rejected = True
 
@@ -1108,9 +1108,9 @@ def relaxed_thinking_sample_kernel(
                 chosen,
             )
 
-            if cur_accepted and (
-                (draft_token_id == think_start_token_id)
-                or (draft_token_id == think_end_token_id)
+            if cur_accepted and draft_token_id in (
+                think_start_token_id,
+                think_end_token_id,
             ):
                 rejected = True
 
