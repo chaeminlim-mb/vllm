@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import math
+import os
 import queue
 import threading
 import time
@@ -80,6 +81,76 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# KV-transfer debug instrumentation (env-gated: MORIIO_KV_DEBUG=1; inert
+# otherwise). Each process appends compact records to its own file under
+# MORIIO_KV_DEBUG_DIR so concurrent TP workers across nodes never interleave.
+# Best-effort: it must never raise into the transfer path. Records identity
+# (which remote blocks + rank a read targets), a cheap content signature of the
+# received KV, and producer-free vs decode-read-done timing (wall clock, so
+# records from different nodes are comparable). Match records across sides by
+# transfer_id. Targets two hypotheses for the high-conc TP8:TP8 corruption:
+#   H1 wrong-region read  -> remote block ids / rank don't match the request
+#   H2 premature free/reuse -> P-free precedes D-done for the same transfer_id
+# ---------------------------------------------------------------------------
+_KVDBG_FH = None
+
+
+def _kvdbg_enabled() -> bool:
+    return os.environ.get("MORIIO_KV_DEBUG", "0") == "1"
+
+
+def _kvdbg(tag: str, **fields: Any) -> None:
+    if not _kvdbg_enabled():
+        return
+    global _KVDBG_FH
+    try:
+        if _KVDBG_FH is None:
+            import socket
+
+            d = os.environ.get("MORIIO_KV_DEBUG_DIR", "/home/edwin.lim/kvdbg")
+            os.makedirs(d, exist_ok=True)
+            path = f"{d}/kvdbg_{socket.gethostname()}_pid{os.getpid()}.log"
+            _KVDBG_FH = open(path, "a", buffering=1)
+        rec = " ".join(f"{k}={v}" for k, v in fields.items())
+        _KVDBG_FH.write(f"{time.time():.6f} {tag} {rec}\n")
+    except Exception:
+        pass
+
+
+def _kvdbg_ids(ids: Collection[int]) -> str:
+    """Compact, space-free rendering of a block-id list (space is the field
+    separator). Full list when short, head+tail elision when long."""
+    ids = list(ids)
+    if len(ids) <= 64:
+        return ",".join(map(str, ids))
+    head = ",".join(map(str, ids[:8]))
+    tail = ",".join(map(str, ids[-8:]))
+    return f"{head},..{len(ids)}..,{tail}"
+
+
+def _kvdbg_sig(kv_tensor, block_ids: Collection[int], num_blocks: int) -> str:
+    """Cheap content signature over the given blocks of a KV tensor: summed
+    value, summed magnitude, nonzero fraction. Not collision-proof, but enough
+    to compare the two sides and to flag zeroed/stale reads. The block dimension
+    is inferred as the (unique) axis whose length == num_blocks."""
+    try:
+        ids = list(block_ids)
+        if not ids:
+            return "empty"
+        shape = tuple(kv_tensor.shape)
+        cand = [i for i, s in enumerate(shape) if s == num_blocks]
+        bdim = cand[0] if len(cand) == 1 else 0
+        idx = torch.as_tensor(ids, device=kv_tensor.device, dtype=torch.long)
+        sel = kv_tensor.index_select(bdim, idx).float()
+        return (
+            f"sum={float(sel.sum()):.4e},abs={float(sel.abs().sum()):.4e},"
+            f"nz={float((sel != 0).float().mean()):.4f},bdim={bdim},shape={shape}"
+        )
+    except Exception as e:  # never break the transfer path
+        return f"ERR({type(e).__name__})"
 
 
 try:
@@ -187,6 +258,16 @@ def resolve_moriio_transfer_ack(
 
 
 class MoRIIOConnector(KVConnectorBase_V1):
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        # MoRIIO READ mode does asynchronous per-layer RDMA reads and blocks in
+        # wait_for_layer_load() between layers. That Python barrier runs between
+        # layers and cannot be captured in a FULL CUDA graph — it would be
+        # skipped during replay, so attention runs before the remote KV lands
+        # (the high-conc TP8 "salad"). Require PIECEWISE so Python executes
+        # between graph pieces and the barrier actually fires.
+        return True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -296,7 +377,8 @@ class MoRIIOConnector(KVConnectorBase_V1):
         self.connector_worker.start_load_kv(self._connector_metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        pass
+        assert self.connector_worker is not None
+        self.connector_worker.wait_for_layer_load(layer_name)
 
     def save_kv_layer(
         self,
@@ -557,15 +639,51 @@ class MoRIIOConnectorScheduler:
                         # Get unhashed blocks to pull from remote.
                         local_block_ids = blocks.get_block_ids()[0]
                         assert len(local_block_ids) <= len(remote_block_ids)
-                        if len(local_block_ids) == len(remote_block_ids):
-                            pass
-                        else:
-                            local_block_ids = remote_block_ids[-len(local_block_ids) :]
+                        if len(local_block_ids) != len(remote_block_ids):
+                            # DIAGNOSTIC (temporary): characterize the local<remote
+                            # mismatch so the full-KV fix is designed from data, not a
+                            # guess (preemption vs off-by-one vs external-match).
+                            logger.warning(
+                                "MoRIIO partial-read req=%s local=%d remote=%d "
+                                "num_external=%d prompt_toks=%d computed=%s",
+                                request.request_id,
+                                len(local_block_ids),
+                                len(remote_block_ids),
+                                num_external_tokens,
+                                len(request.prompt_token_ids or []),
+                                getattr(request, "num_computed_tokens", "?"),
+                            )
+                            # Partial prefix-cache hit: the decode already holds the
+                            # head of the prompt and only needs the prefill's TAIL.
+                            # Keep the decode's own local blocks as the read
+                            # destination and narrow the remote SOURCE to its matching
+                            # tail, so compute_block_transfer_offsets pairs
+                            # decode[i] <- prefill_tail[i] positionally. The previous
+                            # code overwrote local_block_ids with remote's tail IDs --
+                            # using prefill block IDs as the decode destination and,
+                            # with the layout's head-order zip, reading the prefill's
+                            # HEAD into the wrong blocks -> corrupt/incomplete decode KV
+                            # -> degenerate ("0.0, 0.0, ...") output at high concurrency.
+                            params["remote_block_ids"] = remote_block_ids[
+                                -len(local_block_ids) :
+                            ]
 
                         self._reqs_need_recv[request.request_id] = (
                             request,
                             local_block_ids,
                         )
+                        if _kvdbg_enabled():
+                            _kvdbg(
+                                "D-sched",
+                                req=request.request_id,
+                                xfer=params.get("transfer_id"),
+                                nlocal=len(local_block_ids),
+                                nremote=len(params["remote_block_ids"]),
+                                ptoks=len(request.prompt_token_ids or []),
+                                ncomp=getattr(request, "num_computed_tokens", "?"),
+                                local=_kvdbg_ids(local_block_ids),
+                                remote=_kvdbg_ids(params["remote_block_ids"]),
+                            )
                     else:
                         logger.warning(
                             "Got invalid KVTransferParams: %s. This "
@@ -988,10 +1106,15 @@ class MoRIIOConnectorWorker:
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
         self.dst_num_blocks: dict[EngineId, int] = {}
-        # In progress transfers.
-        self._recving_transfers: defaultdict[ReqId, list] = defaultdict(list)
+        # In progress transfers. Keyed per-layer (req_id -> {layer_name: status})
+        # so wait_for_layer_load() can block on exactly the layer whose attention
+        # is about to run; a flat list cannot distinguish which layer landed.
+        self._recving_transfers: defaultdict[ReqId, dict] = defaultdict(dict)
         # Values are (remote_host, remote_notify_port, transfer_id).
         self._recving_transfers_callback_addr: dict[ReqId, tuple[str, str, str]] = {}
+        # KV-transfer debug (env-gated): local_block_ids stashed per req at read
+        # time so _pop_done_transfers can signature the received KV on completion.
+        self._kvdbg_local_blocks: dict[ReqId, list[int]] = {}
 
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
@@ -1026,6 +1149,16 @@ class MoRIIOConnectorWorker:
             use_mla=self.use_mla,
         )
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
+        # READ-mode producer: a decode release-ACK can arrive BEFORE
+        # start_load_kv populates transfer_id_to_request_id (the notify races
+        # ahead of the scheduler->worker sync). Buffer such ACKs and retry them
+        # next get_finished tick instead of dropping them -- dropping loses the
+        # completion, so the request is never marked done_sending, its KV blocks
+        # leak, and the prefill KV cache wedges at high concurrency. Buffered
+        # BEFORE resolve_moriio_transfer_ack, so each ACK is counted exactly once
+        # (on the tick its mapping exists) -- the heterogeneous-TP ack-counting
+        # is preserved.
+        self._pending_unmapped_acks: list = []
 
         # TODO: consider the integration of flashinfer or other backends.
         self.backend_name = backend.get_name()
@@ -1549,16 +1682,22 @@ class MoRIIOConnectorWorker:
             # pop_finished_req_ids returns release ACKs sent by decode. Keep
             # duplicate ACKs because heterogeneous TP can fan multiple decode
             # ranks into one prefill rank for the same transfer_id.
-            finished_acks = self.moriio_wrapper.pop_finished_req_ids()
+            # Combine freshly-arrived ACKs with any buffered from prior ticks
+            # whose transfer_id wasn't mapped yet (notify raced ahead of
+            # start_load_kv); retry the lookup every tick. Buffered before
+            # resolve_moriio_transfer_ack so each ACK is counted exactly once.
+            finished_acks = self._pending_unmapped_acks + list(
+                self.moriio_wrapper.pop_finished_req_ids()
+            )
+            self._pending_unmapped_acks = []
             resolved_transfer_ids: set[TransferId] = set()
             for ack in finished_acks:
                 transfer_id = ack if isinstance(ack, str) else ack.transfer_id
                 if transfer_id not in self.transfer_id_to_request_id:
-                    logger.warning(
-                        "Could not find %s in transfer_id_to_request_id "
-                        "lookup table. This could lead to a possible hang.",
-                        transfer_id,
-                    )
+                    # Mapping not populated yet -- buffer and retry next tick,
+                    # do NOT drop (dropping leaks producer KV at high conc and
+                    # wedges the prefill).
+                    self._pending_unmapped_acks.append(ack)
                     continue
                 resolved_transfer_id = resolve_moriio_transfer_ack(
                     ack,
@@ -1569,6 +1708,14 @@ class MoRIIOConnectorWorker:
                 )
                 if resolved_transfer_id is not None:
                     resolved_transfer_ids.add(resolved_transfer_id)
+                    if _kvdbg_enabled():
+                        _kvdbg(
+                            "P-free",
+                            xfer=resolved_transfer_id,
+                            req=self.transfer_id_to_request_id.get(
+                                resolved_transfer_id, "?"
+                            ),
+                        )
             done_sending = {
                 self.transfer_id_to_request_id[xfer_id]
                 for xfer_id in resolved_transfer_ids
@@ -1607,14 +1754,83 @@ class MoRIIOConnectorWorker:
 
         return done_sending, done_recving
 
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        """Block until every in-flight READ of ``layer_name`` has landed.
+
+        MoRIIO READ posts all of a request's per-layer RDMA reads up front in
+        start_load_kv; they complete asynchronously (a CQ-poll thread flips each
+        status to Succeeded). The attention kernel for ``layer_name`` runs
+        immediately after this returns, so without this barrier attention reads
+        KV that has not arrived yet -> garbage output that scales with
+        concurrency. Only the READ-mode consumer waits; the producer and WRITE
+        mode return immediately.
+
+        A failed read is treated as terminal here and cleaned up non-fatally by
+        _pop_done_transfers (notify prefill + drop). The deadline is a safety
+        valve that logs and proceeds rather than raising, so a stuck transfer
+        can never take down the worker/EngineCore.
+        """
+        if self.is_producer or self.mode != MoRIIOMode.READ:
+            return
+
+        deadline = time.monotonic() + self.moriio_config.transfer_timeout
+        while True:
+            with self.moriio_wrapper.lock:
+                pending = [
+                    status_by_layer[layer_name]
+                    for status_by_layer in self._recving_transfers.values()
+                    if layer_name in status_by_layer
+                ]
+
+            if not pending:
+                return
+
+            still_running = False
+            for status in pending:
+                # Succeeded and Failed are both terminal for the barrier; a
+                # Failed read is notified + dropped in _pop_done_transfers.
+                if status.Succeeded() or status.Failed():
+                    continue
+                still_running = True
+
+            if not still_running:
+                return
+
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "MoRIIO READ barrier timed out for layer %s after "
+                    "transfer_timeout; proceeding (get_finished will notify "
+                    "prefill and drop unfinished requests). Raise "
+                    "transfer_timeout if this is frequent.",
+                    layer_name,
+                )
+                return
+
+            time.sleep(0.001)
+
     def _pop_done_transfers(self) -> set[str]:
         done_req_ids: set[str] = set()
         with self.moriio_wrapper.lock:
             to_remove = []
-            for req_id, status_list in self._recving_transfers.items():
-                last = status_list[-1]
-                if last.Succeeded():
+            for req_id, status_by_layer in self._recving_transfers.items():
+                statuses = list(status_by_layer.values())
+                failed_status = next(
+                    (status for status in statuses if status.Failed()), None
+                )
+                if statuses and all(status.Succeeded() for status in statuses):
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
+                    if _kvdbg_enabled():
+                        lb = self._kvdbg_local_blocks.pop(req_id, [])
+                        l0 = next(iter(self.kv_caches), None)
+                        sig = (
+                            _kvdbg_sig(self.kv_caches[l0], lb, self.num_blocks)
+                            if l0 is not None
+                            else "nolayer"
+                        )
+                        _kvdbg(
+                            "D-done", req=req_id, xfer=xfer_id,
+                            nlocal=len(lb), layer=l0, sig=sig,
+                        )
                     done_req_ids.add(xfer_id)
                     self.moriio_wrapper.send_notify(
                         xfer_id,
@@ -1624,14 +1840,14 @@ class MoRIIOConnectorWorker:
                         message_fields={"consumer_tp_size": self.world_size},
                     )
                     to_remove.append(req_id)
-                elif last.Failed():
+                elif failed_status is not None:
                     logger.error(
                         "RDMA transfer failed for request %s: %s (code=%s). "
                         "Notifying prefill to free blocks; request will be "
                         "aborted by timeout.",
                         req_id,
-                        last.Message(),
-                        last.Code(),
+                        failed_status.Message(),
+                        failed_status.Code(),
                     )
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     try:
@@ -1942,7 +2158,14 @@ class MoRIIOConnectorWorker:
                 not self._ready_requests.empty()
                 and remote_engine_id in self.load_ready_flag
             ):
-                self._read_blocks_for_req(*self._ready_requests.get_nowait())
+                # Drain ALL ready requests, not just one per call (golden
+                # 9f07d0aea "Fix MoRIIO READ handoff routing"). Under a burst of
+                # concurrent requests whose handshakes complete together,
+                # processing only one read per start_load_kv call leaves the rest
+                # queued while the model may already be generating -> they read
+                # incomplete KV -> degenerate output at high concurrency.
+                while not self._ready_requests.empty():
+                    self._read_blocks_for_req(*self._ready_requests.get_nowait())
                 break
             else:
                 break
@@ -2198,6 +2421,22 @@ class MoRIIOConnectorWorker:
             )
         sessions, remote_moriio_meta = self._get_built_session(remote_dp_engine_id)
 
+        if _kvdbg_enabled():
+            self._kvdbg_local_blocks[request_id] = list(local_block_ids)
+            _kvdbg(
+                "D-read",
+                req=request_id,
+                xfer=transfer_id,
+                eff_tp=eff_tp,
+                rdp=remote_dp_rank,
+                rtp=remote_tp_size,
+                flex=int(flexible),
+                nlocal=len(local_block_ids),
+                nremote=len(remote_block_ids),
+                local=_kvdbg_ids(local_block_ids),
+                remote=_kvdbg_ids(remote_block_ids),
+            )
+
         # SQ-full backpressure deadline, shared across this request's layers.
         _sq_deadline = time.monotonic() + self.moriio_config.transfer_timeout
         for layer_name in self.layer_name_to_local_kv_cache_metadata:
@@ -2242,7 +2481,7 @@ class MoRIIOConnectorWorker:
                 time.sleep(_backoff)
                 _backoff = min(_backoff * 2, 0.05)
             with self.moriio_wrapper.lock:
-                self._recving_transfers[request_id].append(transfer_status)
+                self._recving_transfers[request_id][layer_name] = transfer_status
                 self._recving_transfers_callback_addr[request_id] = (
                     remote_host,
                     str(

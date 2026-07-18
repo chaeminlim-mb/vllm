@@ -809,6 +809,14 @@ class Scheduler(SchedulerInterface):
                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
                         and num_new_tokens == 1
                         and (scheduled_running_reqs and not prefill_scheduled)
+                        # Skip padding on the initial external-KV-load step of a
+                        # connector request (e.g. MoRIIO READ, where
+                        # num_external_computed_tokens > 0). The remote side only
+                        # holds prompt KV, so a padded spec slot would reserve a
+                        # decode block with no remote counterpart and trip the
+                        # connector's local<=remote block-count assert. Padding
+                        # resumes on later decode steps (num_external == 0).
+                        and num_external_computed_tokens == 0
                     ):
                         num_new_tokens = 1 + self.num_spec_tokens
                         if (
@@ -870,8 +878,13 @@ class Scheduler(SchedulerInterface):
                 # is used with Spec Decoding where an
                 # extra block gets allocated which
                 # creates a mismatch between the number
-                # of local and remote blocks.
-                limit_lookahead_tokens = load_kv_async and self.use_eagle
+                # of local and remote blocks. This also fires for
+                # synchronous connector reads (e.g. MoRIIO READ mode,
+                # load_kv_async=False) on the initial external-KV-load
+                # step, where num_external_computed_tokens > 0.
+                limit_lookahead_tokens = (
+                    load_kv_async or num_external_computed_tokens > 0
+                ) and self.use_eagle
                 effective_lookahead_tokens = (
                     0 if limit_lookahead_tokens else self.num_lookahead_tokens
                 )
